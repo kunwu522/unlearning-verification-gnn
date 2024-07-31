@@ -2,21 +2,22 @@ import copy
 import math
 import random
 from tqdm import tqdm
+from functools import reduce
 import numpy as np
 import scipy.sparse as sp
+from scipy.optimize import fmin_ncg, fmin_cg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.autograd import grad
 from torch.utils.data import DataLoader
 from torch_geometric.nn import GCNConv
 from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
 
-from .gcn import GCN
+from .gcn import GCN, GCN3, GCN1
 from .gat import GAT
-from .graphsage.encoders import Encoder
-from .graphsage.aggregators import MeanAggregator
-from .graphsage.model import SupervisedGraphSage
+from unlearn.hessian import hessian_vector_product
 import utils
 
 
@@ -39,6 +40,64 @@ import utils
 #         x = self.conv2(x, edge_index)
 #         return x
 
+def to_vector(v):
+    if isinstance(v, tuple) or isinstance(v, list):
+        # return v.cpu().numpy().reshape(-1)
+        return np.concatenate([vv.cpu().numpy().reshape(-1) for vv in v])
+    else:
+        return v.cpu().numpy().reshape(-1)
+
+
+def to_list(v, sizes, device):
+    _v = v
+    result = []
+    for size in sizes:
+        total = reduce(lambda a, b: a * b, size)
+        result.append(_v[:total].reshape(size).float().to(device))
+        _v = _v[total:]
+    return tuple(result)
+
+
+def _mini_batch_hvp(x, **kwargs):
+    model = kwargs['model']
+    features = kwargs['features']
+    x_train = kwargs['x_train']
+    y_train = kwargs['y_train']
+    adj = kwargs['adj']
+    damping = kwargs['damping']
+    device = kwargs['device']
+    sizes = kwargs['sizes']
+    p_idx = kwargs['p_idx']
+    # use_torch = kwargs['use_torch']
+
+    x = to_list(x, sizes, device)
+    _hvp = hessian_vector_product(model, features, adj, x_train, y_train, x, device, p_idx)
+    return [(a + damping * b).view(-1) for a, b in zip(_hvp, x)]
+
+
+def _get_fmin_loss_fn(v, **kwargs):
+    device = kwargs['device']
+
+    def get_fmin_loss(x):
+        x = torch.tensor(x, dtype=torch.float, device=device)
+        hvp = _mini_batch_hvp(x, **kwargs)
+        obj = 0.5 * torch.dot(torch.cat(hvp, dim=0), x) - torch.dot(v, x)
+        return obj.detach().cpu().numpy()
+
+    return get_fmin_loss
+
+
+def _get_fmin_grad_fn(v, **kwargs):
+    device = kwargs['device']
+
+    def get_fmin_grad(x):
+        x = torch.tensor(x, dtype=torch.float, device=device)
+        hvp = _mini_batch_hvp(x, **kwargs)
+        # return to_vector(hvp - v.view(-1))
+        return (torch.cat(hvp, dim=0) - v).cpu().numpy()
+
+    return get_fmin_grad
+
 
 class GNN:
 
@@ -59,7 +118,12 @@ class GNN:
             torch.manual_seed(args.seed)
             torch.cuda.manual_seed_all(args.seed)
             if args.target == 'gcn':
-                self.model = GCN(num_features, args.hidden_size, num_classes, 0.5, activation=activation, bias=bias)
+                if 'layer3' in kwargs and kwargs['layer3']:
+                    self.model = GCN3(num_features, [16, 16], num_classes, args.dropout, activation=activation, bias=bias)
+                elif 'layer1' in kwargs and kwargs['layer1']:
+                    self.model = GCN1(num_features, num_classes, bias=bias)
+                else:
+                    self.model = GCN(num_features, args.hidden_size, num_classes, args.dropout, activation=activation, bias=bias)
                 # self.model = GCN(num_features, args.hidden_size, num_classes, activation=activation)
             elif args.target == 'gat':
                 self.model = GAT(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
@@ -70,7 +134,12 @@ class GNN:
                 pass 
         else:
             if args.target == 'gcn':
-                self.model = GCN(num_features, args.hidden_size, num_classes, 0.5, activation=activation, bias=bias)
+                if 'layer3' in kwargs and kwargs['layer3']:
+                    self.model = GCN3(num_features, [16, 16], num_classes, 0.5, activation=activation, bias=bias)
+                elif 'layer1' in kwargs and kwargs['layer1']:
+                    self.model = GCN1(num_features, num_classes, bias=bias)
+                else:
+                    self.model = GCN(num_features, args.hidden_size, num_classes, 0.5, activation=activation, bias=bias)
             elif args.target == 'gat':
                 self.model = GAT(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
             # self.model = GCN(num_features, args.hidden_size, num_classes, activation=activation)
@@ -151,13 +220,13 @@ class GNN:
 
     def train(self, data, device):
         train_loader = DataLoader(data.train_set, batch_size=self.args.batch, shuffle=False)
-        valid_loader = DataLoader(data.valid_set, batch_size=self.args.test_batch)
+        valid_loader = DataLoader(data.valid_set, batch_size=self.args.test_batch, shuffle=False)
         # edge_index = data.edge_index.to(device)
         adj = torch.sparse_coo_tensor(data.edge_index.cpu(), torch.ones(data.edge_index.size(1)), 
                                       size=(data.num_nodes, data.num_nodes))
-        adj = utils.normalize(torch.eye(data.num_nodes) + adj).to_dense()
+        adj_norm = utils.normalize(torch.eye(data.num_nodes) + adj).to_dense()
 
-        adj = adj.to(device)
+        adj_norm = adj_norm.to(device)
         x = data.x.to(device)
         self.model.to(device)
 
@@ -167,38 +236,49 @@ class GNN:
         best_valid_loss = math.inf
         best_epoch = 0
         trial_count = 0
-        best_model = None
+        # best_model = None
+        best_model_state = self.model.state_dict()
 
         for e in range(1, self.args.epochs + 1):
-            train_loss = 0.
+            # train_loss = 0.
             self.model.train()
-            
-            iterator = tqdm(train_loader, f'  Epoch {e}') if self.args.verbose else train_loader
-            for nodes, y in iterator:
-                nodes, y = nodes.to(device), y.to(device)
+            optimizer.zero_grad()
+            output = self.model(x, adj_norm)[data.train_set.nodes]
+            train_loss = criterion(output, data.train_set.y.to(device))
+            train_loss.backward()
+            optimizer.step()
 
-                self.model.zero_grad()
-                output = self.model(x, adj)
-                # output = self.model(x, edge_index)
-                loss = criterion(output[nodes], y)
-                loss.backward()
-                optimizer.step()
+            # iterator = tqdm(train_loader, f'  Epoch {e}') if self.args.verbose else train_loader
+            # for nodes, y in iterator:
+            #     nodes, y = nodes.to(device), y.to(device)
 
-                train_loss += loss.cpu().item()
+            #     self.model.zero_grad()
+            #     output = self.model(x, adj)
+            #     # output = self.model(x, edge_index)
+            #     loss = criterion(output[nodes], y)
+            #     loss.backward()
+            #     optimizer.step()
+
+            #     train_loss += loss.cpu().item()
             
-            train_loss /= len(train_loader)
+            # train_loss /= len(train_loader)
             
-            valid_loss = 0.
             self.model.eval()
             with torch.no_grad():
-                for nodes, y in valid_loader:
-                    nodes = nodes.to(device)
-                    y = y.to(device)
-                    outputs = self.model(x, adj)
-                    # outputs = self.model(x, edge_index)
-                    loss = criterion(outputs[nodes], y)
-                    valid_loss += loss.cpu().item()
-            valid_loss /= len(valid_loader)
+                output = self.model(x, adj_norm)[data.valid_set.nodes]
+                valid_loss = criterion(output, data.valid_set.y.to(device))
+
+            # valid_loss = 0.
+            # self.model.eval()
+            # with torch.no_grad():
+            #     for nodes, y in valid_loader:
+            #         nodes = nodes.to(device)
+            #         y = y.to(device)
+            #         outputs = self.model(x, adj)
+            #         # outputs = self.model(x, edge_index)
+            #         loss = criterion(outputs[nodes], y)
+            #         valid_loss += loss.cpu().item()
+            # valid_loss /= len(valid_loader)
             
             if self.args.verbose:
                 print(f'  Epoch {e}, training loss: {train_loss:.4f}, validation loss: {valid_loss:.4f}.')
@@ -207,7 +287,7 @@ class GNN:
                 best_valid_loss = valid_loss
                 trial_count = 0
                 best_epoch = e
-                best_model = copy.deepcopy(self.model)
+                best_model_state = self.model.state_dict()
             else:
                 trial_count += 1
                 if trial_count > self.args.patience:
@@ -215,7 +295,7 @@ class GNN:
                         print(f'  Early Stop, the best Epoch is {best_epoch}, validation loss: {best_valid_loss:.4f}.')
                     break
         
-        self.model = best_model
+        self.model.load_state_dict(best_model_state)
         self.model.cpu()
 
     def loss(self, data, loader, criterion, device):
@@ -363,9 +443,10 @@ class GNN:
         recall = recall_score(y_true, y_preds, average='weighted', zero_division=0)
         f1 = f1_score(y_true, y_preds, average='weighted', zero_division=0)
 
+        self.model.cpu()
         return {
             'accuracy': acc,
-            'percision': precision,
+            'precision': precision,
             'recall': recall,
             'f1': f1,
         }
@@ -416,7 +497,75 @@ class GNN:
         delta_w = ws[k] - w_pred
         delta_v = (torch.abs(delta_f) / (torch.linalg.norm(delta_w) ** 2)) * delta_w
         return delta_v.detach()
+    
+    def unlearn(self, target_nodes, data, data_prime, device):
+        """ Feature unlearning
+            Utilize the node feature unlearning algorithm (Chien et al., 2023, https://openreview.net/forum?id=fhcu4FBLciL)
+            w^- = w^* + H^-1 * Delta, where H is the Hessian matrix, Delta = grad(w^*, D) - grad(w^*, D')
+        """
+        infl = self._influence(target_nodes, data, data_prime, device)
+        self._update_model_weight(self.model, infl)
 
+    def _update_model_weight(self, model, infl):
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        with torch.no_grad():
+            delta = [p + infl for p, infl in zip(parameters, infl)]
+            for i, p in enumerate(parameters):
+                p.copy_(delta[i])
+
+    def _influence(self, target_nodes, data, data_prime, device):
+        criterion = torch.nn.CrossEntropyLoss()
+
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
+        adj = data.adjacency_matrix().to_dense().to(device)
+
+        self.model.eval()
+        output = self.model(data.x, adj)
+        l1 = criterion(output, data.y.to(device))
+        g1 = grad(l1, parameters)
+
+        output_prime = self.model(data_prime.x, adj)
+        l2 = criterion(output_prime, data_prime.y.to(device))
+        g2 = grad(l2, parameters)
+
+        delta = [g1[i] - g2[i] for i in range(len(g1))]
+        ihvp = self._inverse_hvp_cp(data, delta, device)
+        I = [0.001 * i for i in ihvp]
+        return I
+    
+    def _inverse_hvp_cp(self, data_prime, delta, device, damping=0.01):
+        adj = data_prime.adjacency_matrix().to_dense().to(device)
+
+        inverse_hvp = []
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
+        for i, (d, p) in enumerate(zip(delta, parameters)):
+            sizes = [p.size()]
+            d = d.view(-1)
+
+            fmin_loss_fn = _get_fmin_loss_fn(d, model=self.model,
+                                             features = data_prime.x,
+                                             x_train=data_prime.train_set.nodes, y_train=data_prime.train_set.y,
+                                             adj=adj, damping=damping,
+                                             sizes=sizes, p_idx=i, device=device)
+
+            fmin_grad_fn = _get_fmin_grad_fn(d, model=self.model,
+                                             features = data_prime.x,
+                                             x_train=data_prime.train_set.nodes, y_train=data_prime.train_set.y,
+                                             adj=adj, damping=damping,
+                                             sizes=sizes, p_idx=i, device=device)
+            res = fmin_cg(
+                f=fmin_loss_fn,
+                x0=to_vector(d),
+                fprime=fmin_grad_fn,
+                gtol=1E-4,
+                # norm='fro',
+                # callback=cg_callback,
+                disp=False,
+                full_output=True,
+                maxiter=100,
+            )
+            inverse_hvp.append(to_list(torch.from_numpy(res[0]), sizes, device)[0])
+        return inverse_hvp
 
     def parameters(self):
         Ws = [p for p in self.model.parameters() if p.requires_grad]
@@ -424,6 +573,9 @@ class GNN:
         if len(Ws) == 2:
             W1, W2 = Ws[0], Ws[1]
             return W1, W2
+        elif len(Ws) == 6:
+            W0, W1, W2, W3, W4, W5 = Ws[0], Ws[1], Ws[2], Ws[3], Ws[4], Ws[5]
+            return W0, W1, W2, W3, W4, W5
         else:
             W0, W1, W2, W3 = Ws[0], Ws[1], Ws[2], Ws[3]
             return W0, W1, W2, W3

@@ -1,4 +1,5 @@
 import random
+import pickle
 from collections import defaultdict, namedtuple
 import numpy as np
 import scipy.sparse as sp
@@ -12,6 +13,7 @@ from torch_geometric.utils import subgraph, to_torch_coo_tensor, to_edge_index, 
 from sklearn.model_selection import train_test_split
 
 import argument
+import utils
 
 class TmpData:
     def __init__(self, x, y, edge_index):
@@ -222,7 +224,7 @@ def mocking_graph():
 
 class GraphDataset:
 
-    def __init__(self, name, dataset, sample_nodes=None, mock=False):
+    def __init__(self, name, dataset, sample_nodes=None, mock=False, binary=False):
         self.name = name
         self.sample_nodes = sample_nodes
         self.mock = mock
@@ -237,13 +239,23 @@ class GraphDataset:
             self.num_classes = dataset.num_classes
 
         self.x = self.data.x
+        if binary:
+            unqiue_labels, counts = torch.unique(self.data.y, return_counts=True)
+            print('unqiue_labels:', unqiue_labels, ', counts:', counts)
+            largest_label = unqiue_labels[torch.argmax(counts)]
+            self.y = torch.where(self.data.y == largest_label, torch.ones_like(self.data.y), torch.zeros_like(self.data.y))
+            print('after binary, unqiue_labels:', torch.unique(self.y, return_counts=True))
+            self.num_classes = 2
+        else:
+            self.y = self.data.y
         # features = torch.zeros(len(self.data.x), self.num_features)
         # nn.init.xavier_normal_(features)
         # self.x = features
-        self.y = self.data.y
+        # self.y = self.data.y
         # Need to preprocess the edge index
         self.edge_index = self.data.edge_index
         self.edge_index = self.edge_index[:, self.edge_index[0] != self.edge_index[1]] # remove self-loop
+        self.edges = self.edge_index.t().tolist()
         if is_undirected(self.edge_index):
             self.edge_index = to_undirected(self.edge_index)
 
@@ -255,9 +267,94 @@ class GraphDataset:
             self.y = self.y[random_nodes]
             self.edge_index = subgraph(torch.tensor(random_nodes, dtype=torch.long), self.edge_index, relabel_nodes=True)[0]
             self.num_nodes = sample_nodes
+            print('Sampled nodes:', self.num_nodes)
+            print('Sampled edges:', self.edge_index.size(1))
         
         self._split_datasets()
         self.adj_list = self._generate_adj_list()
+
+    def partial_graph(self, size):
+        """
+        Approahch 1, randomly sample nodes and edges
+        """
+        # random_nodes = random.sample(range(self.num_nodes), int(size * self.num_nodes))
+        # self.x = self.x[random_nodes]
+        # self.y = self.y[random_nodes]
+        # self.num_nodes = len(random_nodes)
+        # self.partial_to_original = {i: v for i, v in enumerate(random_nodes)}
+        # self.edge_index = subgraph(torch.tensor(random_nodes, dtype=torch.long), self.edge_index, relabel_nodes=True)[0]
+        # self._split_datasets()
+        # self.adj_list = self._generate_adj_list()
+        """
+        Approach 2, randomly fix one node and sample the subgraph in a BFS manner
+        """
+        anchor = self._find_anchor(list(range(self.num_nodes)))
+        subset, self.edge_index = self._bfs_subgraph(anchor, int(size * self.num_nodes), relabel_nodes=True)
+        self.x = self.x[subset]
+        self.y = self.y[subset]
+        self.num_nodes = len(subset)
+        self.partial_to_original = {i: v for i, v in enumerate(subset)}
+        self._split_datasets()
+        self.adj_list = self._generate_adj_list()
+
+    def _find_anchor(self, candidates):
+        """
+        Find the anchor node that has the most edges
+        """
+        # print('candidates:', len(candidates))
+        # idx2node = {i: v for i, v in enumerate(candidates)}
+        # degree = torch.zeros(len(candidates), dtype=torch.int)
+        # for i, candidate in enumerate(candidates):
+        #     degree[i] = self.degree(candidate)
+        # return idx2node[torch.argmax(degree).item()]
+        """
+        Randomly find an anchor node
+        """
+        return random.randint(0, self.num_nodes - 1)
+
+    def _bfs_subgraph(self, anchor, size, relabel_nodes=False):
+        """
+        BFS to sample the subgraph
+        """
+        col, row = self.edge_index
+        node_mask = row.new_empty(self.num_nodes, dtype=torch.bool)
+        edge_mask = row.new_empty(self.num_nodes, dtype=torch.bool)
+
+        if isinstance(anchor, int):
+            anchor = torch.tensor([anchor], dtype=torch.long)
+        elif isinstance(anchor, (list, tuple)):
+            anchor = torch.tensor(anchor, dtype=torch.long)
+        
+        subsets = [anchor]
+        sub_size = 1
+        while sub_size < size:
+            node_mask.fill_(False)
+            node_mask[subsets[-1]] = True
+            torch.index_select(node_mask, 0, row, out=edge_mask)
+            subsets.append(col[edge_mask]) 
+            new_subset = torch.cat(subsets).unique()
+            if len(new_subset) > sub_size:
+                sub_size = len(new_subset)
+            else:
+                # encounter an isolated graph, randomly pick another anchor
+                anchor = self._find_anchor(list(set(range(self.num_nodes)) - set(new_subset.tolist())))
+                subsets.append(torch.tensor([anchor], dtype=torch.long))
+        
+        subset, inv = torch.cat(subsets).unique(return_inverse=True)
+        subset = subset[:size]
+
+        node_mask.fill_(False)
+        node_mask[subset] = True
+        edge_mask = node_mask[row] & node_mask[col]
+        edge_index = self.edge_index[:, edge_mask]
+        if relabel_nodes:
+            mapping = row.new_full((self.num_nodes, ), -1)
+            mapping[subset] = torch.arange(subset.size(0))
+            edge_index = mapping[edge_index]
+        
+        return subset.tolist(), edge_index
+
+
 
     def _generate_adj_list(self):
         _adj_list = defaultdict(set)
@@ -301,6 +398,17 @@ class GraphDataset:
         print('  # of test nodes:', len(nodes_test))
         print('-' * 30)
 
+    def print_info(self):
+        print('-' * 10, 'Data summary', '-' * 10)
+        print('  # of nodes:', self.num_nodes)
+        print('  # of edges:', self.edge_index.size(1))
+        print('  # of features:', self.num_features)
+        print('  # of classes:', self.num_classes)
+        print('  # of train nodes:', len(self.train_set.nodes))
+        print('  # of valid nodes:', len(self.valid_set.nodes))
+        print('  # of test nodes:', len(self.test_set.nodes))
+        print('-' * 30)
+
     def degree(self, v):
         return torch.sum(self.edge_index[0] == v).int().item()
     
@@ -308,7 +416,8 @@ class GraphDataset:
         if self.sample_nodes:
             return torch.sparse_coo_tensor(self.edge_index, torch.ones(self.edge_index.size(1)), (self.sample_nodes, self.sample_nodes))
         else:
-            return to_torch_coo_tensor(self.edge_index)
+            return torch.sparse_coo_tensor(self.edge_index, torch.ones(self.edge_index.size(1)), (self.num_nodes, self.num_nodes))
+            # return to_torch_coo_tensor(self.edge_index)
     
     def update_edge_index_by_adj(self, adj):
         if not adj.is_sparse:
@@ -317,6 +426,9 @@ class GraphDataset:
  
     def add_edges(self, edges):
         self.edge_index = torch.cat((self.edge_index, edges), dim=1)
+        _edge_index = utils.to_directed(self.edge_index)
+        self.edges = _edge_index.t().tolist()
+        self.adj_list = self._generate_adj_list()
 
     def remove_edges(self, edges):
         def _remove_edge(u, v):
@@ -327,6 +439,8 @@ class GraphDataset:
         for u, v in edges:
             _remove_edge(u, v)
             _remove_edge(v, u)
+
+        self.adj_list = self._generate_adj_list()
 
     def has_edge(self, u, v):
         logits = torch.isin(self.edge_index, torch.tensor([u, v]))
@@ -349,7 +463,7 @@ class GraphDataset:
         result = set()
         find_neighbors(nodes, l, result)
         # filter out nodes
-        neighbors = np.array(list(result))
+        neighbors = np.array(list(result), dtype=np.int32)
         neighbors = neighbors[np.where(~np.in1d(neighbors, np.array(nodes)))]
         return neighbors
     
@@ -430,15 +544,21 @@ class GNNDataset(Dataset):
 
 
 
-def load(args):
+def load(args, binary=False):
     if args.dataset == 'cora':
         dataset = GraphDataset(args.dataset, Planetoid(root='./data/cora', name='Cora'), sample_nodes=args.subgraph)
     elif args.dataset == 'citeseer':
-        dataset = GraphDataset(args.dataset, Planetoid(root='./data/citeseer', name='Citeseer'))
+        dataset = GraphDataset(args.dataset, Planetoid(root='./data/citeseer', name='Citeseer'), binary=binary, sample_nodes=args.subgraph)
     elif args.dataset == 'pubmed':
         dataset = GraphDataset(args.dataset, Planetoid(root='./data/pubmed', name='PubMed'))
     elif args.dataset == 'cs':
-        dataset = GraphDataset(args.dataset, Coauthor(root='./data/cs', name='CS'))
+        if args.subgraph is None:
+            dataset = GraphDataset(args.dataset, Coauthor(root='./data/cs', name='CS'), sample_nodes=args.subgraph)
+        else:
+            with open('./data/cs/subsampled_cs.pkl', 'rb') as fp:
+                dataset = pickle.load(fp)
+            dataset._split_datasets()
+
     elif args.dataset == 'facebook':
         dataset = GraphDataset(args.dataset, FacebookPagePage(root='./data/facebook'))
         # dataset = GraphDataset(args.dataset, load_facebook())
@@ -448,7 +568,7 @@ def load(args):
     elif args.dataset == 'photo':
         dataset = GraphDataset(args.dataset, Amazon(root='./data/photo', name='Photo'))
     elif args.dataset == 'lastfm':
-        dataset = GraphDataset(args.dataset, LastFMAsia(root='./data/lastfm'))
+        dataset = GraphDataset(args.dataset, LastFMAsia(root='./data/lastfm'), sample_nodes=args.subgraph)
     elif args.dataset == 'mock':
         dataset = GraphDataset(args.dataset, mocking_graph(), mock=True)
     else:
@@ -463,11 +583,14 @@ if __name__ == '__main__':
          35,  12,   9,  11,   3,  16,   4,   9,   4,   3,  10,   2,
           8,   7,   6,  13,   5,  11]
     parser = argument.load_parser()
-    parser.add_argument('--node', type=int, required=True)
+    parser.add_argument('--node', type=int, required=False)
+    parser.add_argument('--nodes', type=int, nargs='+', required=True)
     args = parser.parse_args()
 
     data = load(args)
-    data.detail_info(args.node)
+    # data.detail_info(args.node)
+    print(data.y[args.nodes].tolist())
+    exit(0)
 
     # for v in range(data.num_nodes):
     #     deg = data.degree(v)

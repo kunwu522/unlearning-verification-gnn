@@ -9,6 +9,7 @@ import networkx.algorithms.community as nx_comm
 import torch
 from torch_geometric.utils import coalesce, to_undirected, is_undirected
 from itertools import combinations
+import scipy.sparse as sp
 
 def get_device(args):
     if torch.backends.mps.is_built():
@@ -43,6 +44,19 @@ def normalize(mx):
         mx = torch.mm(r_mat_inv, mx).mm(r_mat_inv.T)
     return mx
 
+def preprocess_adj(adj, ):
+    N = adj.shape[0]
+    if sp.isspmatrix(adj):
+        adj_tilde = adj + sp.eye(N)
+        degs_inv = np.power(adj_tilde.sum(0), -0.5)
+        # adj_norm = adj
+        adj_norm = adj_tilde.multiply(degs_inv).multiply(degs_inv.T)
+    elif isinstance(adj, np.ndarray):
+        adj_tilde = adj + np.eye(N)
+        degs_inv = np.power(adj_tilde.sum(0), -0.5)
+        adj_norm = np.multiply(np.multiply(adj_tilde, degs_inv[None,:]), degs_inv[:,None])
+
+    return adj_norm
 
 
 def to_directed(edge_index):
@@ -276,3 +290,9 @@ def homophily_entropy(num_classes, labels):
         label_dist[label] = count
     label_dist /= np.sum(label_dist)
     return entropy(label_dist)
+
+def kl_divergence(p, q):
+    kl = np.where(p != 0, p * np.log(p / q), 0)
+    kl = np.where(np.isnan(kl), 0, kl)
+    kl = np.where(np.isinf(kl), 0, kl)
+    return np.sum(kl)

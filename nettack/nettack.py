@@ -23,7 +23,7 @@ class Nettack:
     Technical University of Munich
     """
 
-    def __init__(self, adj, X_obs, z_obs, W1, W2, u, verbose=False, 
+    def __init__(self, adj, X_obs, z_obs, num_classes, W1, W2, u, verbose=False, 
                  add_edge_only=False, target_prediction=None, target_label=None,
                  adj_ul=None, epsilon=0.):
         self.add_edge_only = add_edge_only
@@ -54,7 +54,7 @@ class Nettack:
         # Node labels
         self.z_obs = z_obs.copy()
         self.label_u = self.z_obs[self.u]
-        self.K = np.max(self.z_obs)+1
+        self.K = num_classes
         # GCN weight matrices
         self.W1 = W1
         self.W2 = W2
@@ -337,7 +337,7 @@ class Nettack:
         return a_hat_uv
 
     def attack_surrogate(self, n_perturbations, perturb_structure=True, perturb_features=False,
-                         direct=True, n_influencers=0, delta_cutoff=0.004):
+                         direct=True, n_influencers=0, delta_cutoff=0.04):
         """
         Perform an attack on the surrogate model.
 

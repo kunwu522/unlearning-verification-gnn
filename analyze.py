@@ -99,24 +99,30 @@ def analyze_main_result(result_file):
 
 def analyze_main_result2(result_file):
     df = pd.read_csv(os.path.join('result', result_file))
+    df['tpr'] = df['tp'] / (df['tp'] + df['fn'])
+    df['tnr'] = df['tn'] / (df['tn'] + df['fp'])
     methods = pd.unique(df['method'])
-    num_node_tokens = pd.unique(df['num node tokens'])
-    ps = pd.unique(df['p'])
     for method in methods:
-        for num_node_token in num_node_tokens:
-            for p in ps:
-                _df = df[(df['method'] == method) & (df['num node tokens'] == num_node_token) & (df['p'] == p)]
-                tpr, tnr, fpr, fnr = [], [], [], []
-                for index, row in _df.iterrows():
-                    num_trial = int(row['tp']) + int(row['fp'])
-                    tpr.append(int(row['tp']) / num_trial)
-                    tnr.append(int(row['tn']) / num_trial)
-                    fpr.append(int(row['fp']) / num_trial)
-                    fnr.append(int(row['fn']) / num_trial)
-                print(f'  ==> {method} TPR p={p}: {np.mean(tpr)*100:.1f}% ± {np.std(tpr)*100:.1f}%.')
-                print(f'  ==> {method} TNR p={p}: {np.mean(tnr)*100:.1f}% ± {np.std(tnr)*100:.1f}%.')
-                print(f'  ==> {method} FPR p={p}: {np.mean(fpr)*100:.1f}% ± {np.std(fpr)*100:.1f}%.')
-                print(f'  ==> {method} FNR p={p}: {np.mean(fnr)*100:.1f}% ± {np.std(fnr)*100:.1f}%.')
+        _df = df[df['method'] == method]
+        # _df['tpr'].loc[:, :] = _df['tp'] / (_df['tp'] + _df['fn'])
+        acc_loss = _df['accuracy loss'].values.mean()
+        print('-' * 50, f'{method} Result', '-' * 50)
+        print(f'  ==> Acc loss: {acc_loss:.4f}')
+        print(f'  ==> TNR: {_df["tnr"].values.mean()*100:.1f}% ± {_df["tnr"].values.std()*100:.1f}%')
+        print(f'  ==> TPR: {_df.groupby(["method", "p"]).mean()["tpr"]}')
+        # for p in ps:
+        #     _df = df[(df['method'] == method) & (df['p'] == p)]
+        #     tpr, tnr, fpr, fnr = [], [], [], []
+        #     for index, row in _df.iterrows():
+        #         num_trial = int(row['tp']) + int(row['fn'])
+        #         tpr.append(int(row['tp']) / num_trial)
+        #         tnr.append(int(row['tn']) / num_trial)
+        #         fpr.append(int(row['fp']) / num_trial)
+        #         fnr.append(int(row['fn']) / num_trial)
+        #     print(f'  ==> {method} TPR p={p}: {np.mean(tpr)*100:.1f}% ± {np.std(tpr)*100:.1f}%.')
+        #     print(f'  ==> {method} TNR p={p}: {np.mean(tnr)*100:.1f}% ± {np.std(tnr)*100:.1f}%.')
+        #     print(f'  ==> {method} FPR p={p}: {np.mean(fpr)*100:.1f}% ± {np.std(fpr)*100:.1f}%.')
+        #     print(f'  ==> {method} FNR p={p}: {np.mean(fnr)*100:.1f}% ± {np.std(fnr)*100:.1f}%.')
 
 
 if __name__ == '__main__':
