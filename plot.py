@@ -35,6 +35,7 @@ def incomplete_ratio_result(result_filename, dataset):
     df = pd.read_csv(result_filename)
     df['tpr'] = df['tp'] / (df['tp'] + df['fn'])
     df = df[df['method'] != 'ig']
+    df = df[df['method'] != 'rnd']
 
     custom = {
         "axes.edgecolor": "gray", 
@@ -77,6 +78,7 @@ def incomplete_ratio_result(result_filename, dataset):
 
 def num_pert_edges_result(result_filename, dataset):
     df = pd.read_csv(result_filename)
+    df = df[df['method'] != 'rnd']
 
     custom = {
         "axes.edgecolor": "gray", 
@@ -91,14 +93,18 @@ def num_pert_edges_result(result_filename, dataset):
     plt.rc('legend', fontsize=16)
     plt.rc('font', size=24)
 
-    hue_order = ['ours', 'nettack', 'sga', 'fga', 'rnd']
-    c = sns.color_palette('Set1', n_colors=5)
-    ax = sns.lineplot(x='num_pert_edges', y='tpr', data=df, hue='method', hue_order=hue_order,
+    hue_order = ['ours', 'nettack', 'sga', 'fga']
+    c = sns.color_palette('Set1', n_colors=4)
+    # ax = sns.lineplot(x='num_pert_edges', y='tpr', data=df, hue='method', hue_order=hue_order,
+    #                   palette=c, errorbar=None, style='method', 
+    #                   markers=["s", "P", "X", "o"], dashes=False, markersize=10)
+    ax = sns.lineplot(x='num_pert_edges', y='tnr', data=df, hue='method', hue_order=hue_order,
                       palette=c, errorbar=None, style='method', 
-                      markers=True, dashes=False, markersize=10)
+                      markers=["o", "s", "P", "X"], dashes=False, markersize=10)
     vals = ax.get_yticks()
     ax.set_yticklabels(['{:,.0%}'.format(x) for x in vals])
     labels = plt.gca().get_legend_handles_labels()
+
     print(labels)
 
     plt.xlabel('Number of challenge edges')
@@ -106,14 +112,15 @@ def num_pert_edges_result(result_filename, dataset):
     # plt.xlabel('p')
     # plt.ylim(0.4, 1.0)
     plt.ylabel('True positive probability')
+    # plt.ylabel('True negative probability')
     plt.legend([], [], frameon=False)
-    plt.savefig(f'./figures/num_pert_edges_{dataset}.pdf', dpi=300, bbox_inches='tight')
+    plt.savefig(f'./figures/num_pert_edges_tnr_{dataset}.pdf', dpi=300, bbox_inches='tight')
     plt.show()
 
     fig_legend, ax_legend = plt.subplots(figsize=(10, 1))
     ax_legend.axis('off')
-    legend_names = ['PANDA (ours)', 'Nettack', 'SGAttack', 'FGA', 'RND']
-    ax_legend.legend(labels[0], legend_names, loc='center', ncol=5)
+    legend_names = ['PANDA (ours)', 'Nettack', 'SGAttack', 'FGA']
+    ax_legend.legend(labels[0], legend_names, loc='center', ncol=4)
     fig_legend.savefig('./figures/num_pert_edges_legend.pdf', dpi=300, bbox_inches='tight')
 
 
@@ -222,30 +229,65 @@ def probabilistic_guarantee():
     plt.savefig('./figures/probabilistic_guarantee.pdf', dpi=300, bbox_inches='tight')
 
 
-def new_figure():
-    # x = np.linspace(0.4, 0.8, 100)
-    x = np.linspace(0.5, 0.999, 100)
+def alpha_against_m():
+    # x = np.linspace(0.4, 0.8, 50)
+    x = np.linspace(0.5, 0.999, 20)
+    # x = [0.5, 0.6, 0.7, 0.8, 0.9, 0.999]
 
     sns.set_style('white')
-    # plt.figure(figsize=(4, 5))
-    plt.rc('axes', labelsize=18)
-    plt.rc('xtick', labelsize=18)
-    plt.rc('ytick', labelsize=18)
+    plt.figure(figsize=(4.5, 5))
+    plt.rc('axes', labelsize=20)
+    plt.rc('xtick', labelsize=20)
+    plt.rc('ytick', labelsize=20)
     plt.rc('legend', fontsize=16)
     plt.rc('font', size=20)
+
+    # y = [[math.ceil(math.log(1 - alpha, 1 - xx)) for xx in x] for alpha in [0.70, 0.80, 0.85, 0.9, 0.99]]
+    # plt.stackplot(x, y, labels=[f'$\\alpha$ = {alpha:.2f}' for alpha in [0.70, 0.80, 0.85, 0.9, 0.99]], baseline='zero')
     # for alpha in [0.70, 0.80, 0.85, 0.9, 0.99]:
-    for beta in [0.70, 0.80, 0.85, 0.9, 0.99]:
-    # for beta in [0.95, 0.96, 0.97, 0.98, 0.99]:
-        # y = 1 - ((N - k * N) / N) ** x
-        # print('alpha:', alpha, ', x:', x, ', 1 - alpha:', 1 - alpha)
-        # try:
-        y = [math.log(1 - beta, 1 - xx) for xx in x]
+    for alpha in [0.70, 0.9, 0.99]:
+        y = [math.ceil(math.log(1 - alpha, 1 - xx)) for xx in x]
+
+        # ax = sns.scatterplot(x=x, y=y, label=f'$\\alpha$ = {alpha:.2f}', legend=True, marker='o')
+        plt.step(x, y, where='mid', label=f'$\\alpha$ = {alpha:.2f}')
+        # ax.set_yticklabels([f'{math.ceil(x)}' for x in ax.get_yticks()])
+    # plt.xlabel('Soundness/completeness probability (p/q)')
+    # plt.xlabel('Soundness probability (p)')
+    plt.xlabel('Completeness probability (q)')
+    plt.xticks([0.5, 0.6, 0.7, 0.8, 0.9, 1])
+    plt.ylabel('Lowerbound')
+    plt.legend()
+    # plt.yticks([1, 2])
+    # ax.set_xticklabels(['{:,.0%}'.format(x) for x in [0.1, 0.2, 0.3, 0.4, 0.5]])
+    # plt.show()
+    plt.tight_layout()
+    plt.savefig('./figures/alpha_against_m.pdf', dpi=300, bbox_inches='tight')
+
+def beta_against_m():
+    # x = np.linspace(0.4, 0.8, 100)
+    x = np.linspace(0.5, 0.99, 20)
+
+    sns.set_style('white')
+    plt.figure(figsize=(4.5, 5))
+    plt.rc('axes', labelsize=20)
+    plt.rc('xtick', labelsize=20)
+    plt.rc('ytick', labelsize=20)
+    plt.rc('legend', fontsize=16)
+    plt.rc('font', size=20)
+    # for beta in [0.70, 0.80, 0.85, 0.9, 0.99]:
+    for beta in [0.70, 0.9, 0.99]:
+        y = [math.floor(math.log(beta, xx)) for xx in x]
 
         # sns.lineplot(x=x, y=y, label=f'{k:.0%} as challenge edges', legend=True)
-        ax = sns.lineplot(x=x, y=y, label=f'$\\alpha / \\beta$ = {beta:.2f}', legend=True)
-        ax.set_yticklabels([f'{math.ceil(x)}' for x in ax.get_yticks()])
-    plt.xlabel('Soundness/completeness probability (p/q)')
-    plt.ylabel('Number of token nodes (m)')
+        plt.step(x, y, where='mid', label=f'$\\beta$ = {beta:.2f}')
+        # ax = sns.lineplot(x=x, y=y, label=f'$\\beta$ = {beta:.2f}', legend=True)
+        # ax.set_yticklabels([f'{math.ceil(x)}' for x in ax.get_yticks()])
+    # plt.xlabel('Soundness/completeness probability (p/q)')
+    plt.xlabel('Soundness probability (p)')
+    plt.xticks([0.5, 0.6, 0.7, 0.8, 0.9, 1])
+    # plt.xlabel('Completeness probability (q)')
+    plt.ylabel('Upperbound')
+    plt.legend()
     # plt.yticks([1, 2])
     # ax.set_xticklabels(['{:,.0%}'.format(x) for x in [0.1, 0.2, 0.3, 0.4, 0.5]])
     # plt.show()
@@ -315,6 +357,45 @@ def empirical_vs_theortical(result_filename):
     # plt.xticks([0.1, 0.2, 0.3, 0.4, 0.5])
     # ax.set_xticklabels(['{:,.0%}'.format(x) for x in [0.1, 0.2, 0.3, 0.4, 0.5]])
     # plt.savefig('./figures/probabilistic_guarantee.pdf', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def differnt_surrogates():
+    df = pd.DataFrame({
+        'P': [r'P_{TP}', r'P_{TN}', r'P_{TP}', r'P_{TN}', r'P_{TP}', r'P_{TN}', r'P_{TP}', r'P_{TN}', r'P_{TP}', r'P_{TN}'],
+        'Effectiveness': [0.844, 1, 0.872, 1, 0.866, 1, 0.888, 1, 0.960, 1],
+    })
+
+
+    custom = {
+        "axes.edgecolor": "gray", 
+        # "grid.linestyle": "dashed", 
+        "grid.color": "gray",
+    } 
+    sns.set_style("white", rc = custom)
+    plt.figure()
+    plt.rc('axes', labelsize=20)
+    plt.rc('xtick', labelsize=20)
+    plt.rc('ytick', labelsize=20)
+    plt.rc('legend', fontsize=16)
+    plt.rc('font', size=20)
+
+    # hue_order = ['ours', 'nettack', 'minmax']
+    c = sns.color_palette('Set1', n_colors=7)
+    ax = sns.lineplot(x='incomplete_ratio', y='tpr', data=df, marker="o",
+                      errorbar=None, markers=True, dashes=False, markersize=10)
+    vals = ax.get_yticks()
+    ax.set_yticklabels(['{:,.0%}'.format(x) for x in vals])
+    labels = plt.gca().get_legend_handles_labels()
+    print(labels)
+
+    plt.xlabel('Incompleteness ratio')
+    plt.xticks([0.2, 0.4, 0.6, 0.8])
+    # plt.xlabel('p')
+    # plt.ylim(0.4, 1.0)
+    plt.ylabel('True positive rate')
+    # plt.legend([], [], frameon=False)
+    plt.savefig(f'./figures/incomplete_ratio.pdf', dpi=300, bbox_inches='tight')
     plt.show()
 
 def incomplete_ratio(result_filename):
@@ -419,8 +500,9 @@ if __name__ == '__main__':
         mixing_verify(args.result)
     elif args.task == 'empirical':
         empirical_vs_theortical(args.result)
-    elif args.task == 'new_figure':
-        new_figure()
+    elif args.task == 'm':
+        alpha_against_m()
+        beta_against_m()
     elif args.task == 'incomplete_ratio':
         incomplete_ratio_result(args.result, 'citeseer')
     elif args.task == 'num_challenge_edges':

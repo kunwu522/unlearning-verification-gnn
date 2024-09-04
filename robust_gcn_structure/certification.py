@@ -703,20 +703,26 @@ class Problem:
             self.epsilon_plus_0_indices = parent_problem.epsilon_plus_0_indices.copy()
 
         if branch_ix is not None and split_ix is not None:
-
-            if branch_ix in [1, 4]:
-                self.U_x[split_ix] = self.x_val[split_ix]
-                if self.x_val[split_ix] < self.x_orig[split_ix]:
-                    # if the value in the pre-processed adjacency matrix is smaller than the original value,
-                    # this means that we need to completely remove the edge.
-                    self.U_x[split_ix] = 0
-                    self.epsilon_plus_0_indices = self.epsilon_plus_0_indices.union({split_ix})
-            else:
+            if branch_ix not in [1, 4]:
                 self.L_x[split_ix] = self.x_val[split_ix]
                 if self.x_val[split_ix] > self.x_orig[split_ix]:
                     # if the value is larger than the original value, then we set epsilon_minus to zero.
                     self.epsilon_minus_0_indices = self.epsilon_minus_0_indices.union({split_ix})
 
+            # if branch_ix in [1, 4]:
+            #     self.U_x[split_ix] = self.x_val[split_ix]
+            #     if self.x_val[split_ix] < self.x_orig[split_ix]:
+            #         # if the value in the pre-processed adjacency matrix is smaller than the original value,
+            #         # this means that we need to completely remove the edge.
+            #         self.U_x[split_ix] = 0
+            #         self.epsilon_plus_0_indices = self.epsilon_plus_0_indices.union({split_ix})
+            # else:
+            #     self.L_x[split_ix] = self.x_val[split_ix]
+            #     if self.x_val[split_ix] > self.x_orig[split_ix]:
+            #         # if the value is larger than the original value, then we set epsilon_minus to zero.
+            #         self.epsilon_minus_0_indices = self.epsilon_minus_0_indices.union({split_ix})
+            # print('epsilon_plus_0_indices', self.epsilon_plus_0_indices)
+            # print('epsilon_minus_0_indices:', self.epsilon_minus_0_indices)
             if branch_ix in [1, 2]:
                 self.U_z[split_ix] = self.z_val[split_ix]
             else:
@@ -739,8 +745,8 @@ class Problem:
                      self.x_var[split_ix] <= self.U_x[split_ix],
                      self.z_var[split_ix] >= self.L_z[split_ix],
                      self.z_var[split_ix] <= self.U_z[split_ix]]
-                    + [self.eps_minus_x[ix] == 0 for ix in self.epsilon_minus_0_indices]
-                    + [self.eps_plus_x[ix] == 0 for ix in self.epsilon_plus_0_indices]
+                    # + [self.eps_minus_x[ix] == 0 for ix in self.epsilon_minus_0_indices]
+                    # + [self.eps_plus_x[ix] == 0 for ix in self.epsilon_plus_0_indices]
                     )
         if 'constr_n' not in self.constraints:
             self.constraints['constr_n'] = []
@@ -758,11 +764,12 @@ class Problem:
 
     def solve(self, solver="ECOS"):
         if solver == 'cplex':
-            import cplex
-            self.problem.solve(solver=cvx.CPLEX, verbose=True)
-        else:
-            self.problem.solve(solver=cvx.CLARABEL, verbose=False) 
+            self.problem.solve(solver=cvx.CPLEX, verbose=False)
+        elif solver == 'ECOS':
+            self.problem.solve(solver='ECOS', verbose=False) 
             # self.problem.solve(solver=solver, verbose=True, max_iters=50, abstol=1e-4, reltol=1e-4, feastol=1e-9)
+        else:
+            self.problem.solve(solver=cvx.CLARABEL, verbose=False, time_limit=2.) 
         self.x_opt = self.x_var.value
         self.z_opt = self.z_var.value
         self.vex_opt = self.vex_n.value

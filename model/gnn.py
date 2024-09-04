@@ -12,11 +12,13 @@ import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.autograd import grad
 from torch.utils.data import DataLoader
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, SAGEConv
 from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
 
 from .gcn import GCN, GCN3, GCN1
 from .gat import GAT
+from .sage import GraphSAGE
+from .gin import GIN
 from unlearn.hessian import hessian_vector_product
 import utils
 
@@ -128,10 +130,9 @@ class GNN:
             elif args.target == 'gat':
                 self.model = GAT(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
             elif args.target == 'sage':
-                # features = nn.Embedding()
-                # agg1 = MeanAggregator(data.x, cuda=device)
-                # self.model =
-                pass 
+                self.model = GraphSAGE(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
+            elif args.target == 'gin':
+                self.model = GIN(num_features, args.hidden_size, num_classes, args.dropout, activation=activation, bias=bias)
         else:
             if args.target == 'gcn':
                 if 'layer3' in kwargs and kwargs['layer3']:
@@ -142,6 +143,10 @@ class GNN:
                     self.model = GCN(num_features, args.hidden_size, num_classes, 0.5, activation=activation, bias=bias)
             elif args.target == 'gat':
                 self.model = GAT(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
+            elif args.target == 'sage':
+                self.model = GraphSAGE(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
+            elif args.target == 'gin':
+                self.model = GIN(num_features, args.hidden_size, num_classes, args.dropout, activation=activation, bias=bias)
             # self.model = GCN(num_features, args.hidden_size, num_classes, activation=activation)
 
     def insufficient_train(self, data, device):
@@ -221,7 +226,7 @@ class GNN:
     def train(self, data, device):
         train_loader = DataLoader(data.train_set, batch_size=self.args.batch, shuffle=False)
         valid_loader = DataLoader(data.valid_set, batch_size=self.args.test_batch, shuffle=False)
-        # edge_index = data.edge_index.to(device)
+        edge_index = data.edge_index.to(device)
         adj = torch.sparse_coo_tensor(data.edge_index.cpu(), torch.ones(data.edge_index.size(1)), 
                                       size=(data.num_nodes, data.num_nodes))
         adj_norm = utils.normalize(torch.eye(data.num_nodes) + adj).to_dense()
@@ -243,7 +248,10 @@ class GNN:
             # train_loss = 0.
             self.model.train()
             optimizer.zero_grad()
-            output = self.model(x, adj_norm)[data.train_set.nodes]
+            if isinstance(self.model, (GAT, GraphSAGE, GIN)):
+                output = self.model(x, edge_index)[data.train_set.nodes]
+            else:
+                output = self.model(x, adj_norm)[data.train_set.nodes]
             train_loss = criterion(output, data.train_set.y.to(device))
             train_loss.backward()
             optimizer.step()
@@ -265,7 +273,10 @@ class GNN:
             
             self.model.eval()
             with torch.no_grad():
-                output = self.model(x, adj_norm)[data.valid_set.nodes]
+                if isinstance(self.model, (GAT, GraphSAGE, GIN)):
+                    output = self.model(x, edge_index)[data.valid_set.nodes]
+                else:
+                    output = self.model(x, adj_norm)[data.valid_set.nodes]
                 valid_loss = criterion(output, data.valid_set.y.to(device))
 
             # valid_loss = 0.
@@ -383,10 +394,14 @@ class GNN:
         
         x = data.x.to(device)
         self.model.to(device)
+        edge_index = data.edge_index.to(device)
         
         self.model.eval()
         with torch.no_grad():
-            outputs = self.model(x, adj)
+            if isinstance(self.model, (GAT, GraphSAGE, GIN)):
+                outputs = self.model(x, edge_index)
+            else:
+                outputs = self.model(x, adj)
             # outputs = self.model(x, edge_index)
             if target_nodes is None:
                 y_pred = torch.argmax(outputs, dim=1).cpu().numpy()
@@ -424,6 +439,7 @@ class GNN:
 
         x = data.x.to(device)
         self.model.to(device)
+        edge_index = data.edge_index.to(device)
 
         y_preds, y_true = [], []
         self.model.eval()
@@ -431,13 +447,16 @@ class GNN:
             for nodes, labels in test_loader:
                 nodes = nodes.to(device)
                 labels = labels.to(device)
-                outputs = self.model(x, adj)
+                if isinstance(self.model, (GAT, GraphSAGE, GIN)):
+                    outputs = self.model(x, edge_index)
+                else:
+                    outputs = self.model(x, adj)
                 # outputs = self.model(x, edge_index)
                 y_pred = torch.argmax(outputs[nodes], dim=1)
                 y_preds.extend(y_pred.cpu().tolist())
                 y_true.extend(labels.cpu().tolist())
         
-        results = classification_report(y_true, y_preds, digits=4, output_dict=True)
+        # results = classification_report(y_true, y_preds, digits=4, output_dict=True, zero_division=0)
         acc = accuracy_score(y_true, y_preds)
         precision = precision_score(y_true, y_preds, average='weighted', zero_division=0)
         recall = recall_score(y_true, y_preds, average='weighted', zero_division=0)

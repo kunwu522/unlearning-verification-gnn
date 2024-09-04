@@ -1,15 +1,17 @@
 import random
 import pickle
 from collections import defaultdict, namedtuple
+from tqdm import tqdm
 import numpy as np
 import scipy.sparse as sp
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import networkx as nx
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
-from torch_geometric.datasets import Planetoid, Coauthor, FacebookPagePage, CitationFull, Amazon, LastFMAsia
-from torch_geometric.utils import subgraph, to_torch_coo_tensor, to_edge_index, k_hop_subgraph, is_undirected, to_undirected, to_networkx
+from torch_geometric.datasets import Planetoid, Coauthor, FacebookPagePage, CitationFull, Amazon, LastFMAsia, PolBlogs
+from torch_geometric.utils import subgraph, to_torch_coo_tensor, to_edge_index, k_hop_subgraph, is_undirected, to_undirected, to_networkx, homophily
 from sklearn.model_selection import train_test_split
 
 import argument
@@ -527,6 +529,80 @@ class GraphDataset:
         except nx.NetworkXNoPath:
             return np.inf
         return length
+    
+    def _cosine_similarity(self, u, v):
+        return torch.dot(self.x[u], self.x[v]) / (torch.norm(self.x[u]) * torch.norm(self.x[v]))
+    
+    def measure_density(self, G):
+        return nx.density(G)
+    
+    def measure_community_structure(self):
+        h = homophily(self.edge_index, self.y)
+        # from networkx.algorithms import community
+        # # Using Girvan-Newman algorithm to find communities
+        # communities_generator = community.girvan_newman(G)
+        # top_level_communities = next(communities_generator)
+        # communities = sorted(map(sorted, top_level_communities))
+        
+        # # Print the number of communities and their sizes
+        # num_communities = len(communities)
+        # community_sizes = [len(c) for c in communities]
+        # print(f"Number of Communities: {num_communities}")
+        # print(f"Community Sizes: {community_sizes}")
+        # return communities
+        return h
+    
+    # Function to plot node degree distribution
+    def plot_degree_distribution(self, G):
+        from collections import Counter
+        degrees = [degree for node, degree in G.degree()]
+        degree_count = Counter(degrees)
+        deg, cnt = zip(*degree_count.items())
+        
+        plt.figure(figsize=(8, 6))
+        plt.bar(deg, cnt, width=0.8, color='b')
+        plt.title("Degree Distribution")
+        plt.xlabel("Degree")
+        plt.ylabel("Count")
+        plt.yscale('log') # Use log scale for better visibility of distribution
+        plt.xscale('log')
+        plt.show()
+
+        print(f"Node Degree Distribution: {degree_count}")
+        return degree_count
+    
+    def lp_analysis(self, edges):
+        """
+        Analyze the label prediction
+        1. Calculate the common neighbors
+        2. Count the number of paths
+        3. Feature proximity
+        """
+        data = Data(edge_index=self.edge_index, num_nodes=self.num_nodes)
+        G = to_networkx(data)
+
+        density = self.measure_density(G)
+        print(f'Density: {density}')
+        communities = self.measure_community_structure()
+        print(f'Communities: {communities}')
+        degree_dist = self.plot_degree_distribution(G)
+        print(f'Degree Distribution: {degree_dist}')
+
+        # lsp_list, gsp_listm, fh_list = [], [], []
+        # # for v in tqdm(range(self.num_nodes)):
+        # #     for u in range(v + 1, self.num_nodes):
+        # for u, v in edges:
+        #     cn = len(set(self.adj_list[v]).intersection(set(self.adj_list[u])))
+        #     gsp = len(list(nx.all_simple_paths(G, source=v, target=u, cutoff=2)))
+        #     fh = self._cosine_similarity(v, u)
+        #     lsp_list.append(cn)
+        #     gsp_listm.append(gsp)
+        #     fh_list.append(fh)
+        #     print(f'v: {v}, u: {u}, cn: {cn}, gsp: {gsp}, fh: {fh}')
+        
+        # print('Common neighbors:', np.mean(lsp_list), np.std(lsp_list))
+        # print('Number of paths:', np.mean(gsp_listm), np.std(gsp_listm))
+        # print('Feature proximity:', np.mean(fh_list), np.std(fh_list))
 
 
 
@@ -553,11 +629,14 @@ def load(args, binary=False):
         dataset = GraphDataset(args.dataset, Planetoid(root='./data/pubmed', name='PubMed'))
     elif args.dataset == 'cs':
         if args.subgraph is None:
-            dataset = GraphDataset(args.dataset, Coauthor(root='./data/cs', name='CS'), sample_nodes=args.subgraph)
+            dataset = GraphDataset(args.dataset, Coauthor(root='./data/cs', name='CS'), binary=binary, sample_nodes=10000)
         else:
             with open('./data/cs/subsampled_cs.pkl', 'rb') as fp:
                 dataset = pickle.load(fp)
             dataset._split_datasets()
+            dataset.edges = dataset.edge_index.t().tolist()
+    elif args.dataset == 'polblogs':
+        dataset = GraphDataset(args.dataset, PolBlogs(root='./data/polblogs'))
 
     elif args.dataset == 'facebook':
         dataset = GraphDataset(args.dataset, FacebookPagePage(root='./data/facebook'))
@@ -568,7 +647,7 @@ def load(args, binary=False):
     elif args.dataset == 'photo':
         dataset = GraphDataset(args.dataset, Amazon(root='./data/photo', name='Photo'))
     elif args.dataset == 'lastfm':
-        dataset = GraphDataset(args.dataset, LastFMAsia(root='./data/lastfm'), sample_nodes=args.subgraph)
+        dataset = GraphDataset(args.dataset, LastFMAsia(root='./data/lastfm'), binary=binary, sample_nodes=args.subgraph)
     elif args.dataset == 'mock':
         dataset = GraphDataset(args.dataset, mocking_graph(), mock=True)
     else:
