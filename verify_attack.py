@@ -1,8 +1,7 @@
 """
 Minimum Min-Max attack
 
-Kun Wu
-Stevens Institute of Technology
+hiding for anonymity
 """
 
 

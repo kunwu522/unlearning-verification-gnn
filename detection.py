@@ -7,9 +7,8 @@
     3. ProximityDetect
     COMPARING AND DETECTING ADVERSARIAL ATTACKS FOR GRAPH DEEP LEARNING, Zhang et al., 2019
 
-    Author: Kun Wu
+    Author: hiding for anonymity
     
-    Stevens Institute of Technology
 """
 import os
 import time

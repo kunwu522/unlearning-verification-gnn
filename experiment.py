@@ -6269,7 +6269,7 @@ def varying_num_token_nodes(args):
         surrogate.train(surrogate_data, device)
 
         _num_behaviors = 5
-        for num_token_nodes in [2]:
+        for num_token_nodes in [6]:
             # args.num_target_nodes = 2 # When P=0.9, q=0.73, the number of target nodes is 2
             # args.num_perts = num_pert_edges
             # args.T = num_pert_edges * 3

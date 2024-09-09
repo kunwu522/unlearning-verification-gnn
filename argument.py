@@ -2,8 +2,8 @@
 Common arguments for training GNN models
 
 Copyright (C) 2023
-Kun Wu
-Stevens Institute of Technology
+hiding for anonymity
+
 '''
 import argparse
 

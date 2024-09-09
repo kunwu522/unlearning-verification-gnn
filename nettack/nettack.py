@@ -465,7 +465,7 @@ class Nettack:
                 In order to control how to perturb graph structure (adding/removing edges) by self.add_edge_only,
                 add the following code.
                 
-                Modified by Kun Wu @ Feb 14th, 2023 
+                Modified by hiding for anonymity @ Feb 14th, 2023 
                 """
                 if self.add_edge_only:
                     for ix in np.asarray(struct_scores).squeeze().argsort():

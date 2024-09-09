@@ -103,7 +103,7 @@ class GCNNodeCertification:
         self.degs_oh_tilde = self.degs[self.onehop_nbs] + 1
         self.degs_th_tilde = self.degs[self.twohop_nbs] + 1
 
-        """ Modified by Kun Wu, 2023-07-13
+        """ Modified by hiding for anonymity, 2023-07-13
             We only want to find 1-perturbation nodes, therefore, we set the max_delete to 1
 
             # keep at least one edge per node

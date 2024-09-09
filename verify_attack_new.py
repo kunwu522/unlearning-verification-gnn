@@ -9,8 +9,7 @@ Therefore, I change it to a novel unlearning attack which is
     Those edges are the perturbations for verifiable unlearning.
 
 
-Kun Wu
-Stevens Institute of Technology
+hiding for anonymity
 """
 
 
