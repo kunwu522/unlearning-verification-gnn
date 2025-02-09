@@ -58,6 +58,10 @@ def preprocess_adj(adj, ):
 
     return adj_norm
 
+def confidence(logits):
+    sorted_logits = np.sort(logits, axis=1)[:, ::-1]
+    uncertain_scores = sorted_logits[:, 0] - sorted_logits[:, 1]
+    return uncertain_scores
 
 def to_directed(edge_index):
     _edge_index = coalesce(edge_index)

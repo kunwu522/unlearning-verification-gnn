@@ -755,7 +755,7 @@ class CertifiedFragilenessLazy(object):
     
     """
     def __init__(self, args, weights, data, num_layer=2,
-                 tolerance=1e-2, max_iter=50, verbose=False) -> None:
+                 tolerance=1e-2, max_iter=50, verbose=False, deletion=None) -> None:
         self.args = args
         self.data = data
         self.num_layer = num_layer
@@ -764,6 +764,7 @@ class CertifiedFragilenessLazy(object):
         self.verbose = verbose
 
         # print('weights:', [p.shape for p in weights])
+        # print('num_layer:', num_layer, ', weights:', len(weights))
 
         if len(weights) == 4:
             self.W1, self.b1, self.W2, self.b2 = weights
@@ -787,6 +788,11 @@ class CertifiedFragilenessLazy(object):
             self.W1, self.b1, self.W2, self.b2, self.W3, self.b3 = weights
             self.bias = True
             self.theta = (self.W1, self.b1, self.W2, self.b2, self.W3, self.b3)
+
+        self.deletion = False
+        if deletion is not None:
+            self.del1, self.del2 = deletion
+            self.deletion = True
 
         self.X = self.data.x.numpy()
         self.adj = self.data.adjacency_matrix().to_dense().numpy()
@@ -869,7 +875,12 @@ class CertifiedFragilenessLazy(object):
         else:
             H2_hat_cvx = adj_norm_cvx @ XW
             H2_hat = self._adj_norm @ XW
-        
+
+        if self.deletion:
+            H2_hat_cvx = H2_hat_cvx @ self.del1
+            H2_hat = H2_hat @ self.del1
+
+
         H2 = relu(H2_hat)
         H2_cvx = cp.Variable(shape=(H2_hat.shape[0], H2_hat.shape[1]), name="H2", nonneg=True)
         H2_cvx.value = H2 
@@ -1011,8 +1022,12 @@ class CertifiedFragilenessLazy(object):
                     return {'fragile': False, 'error': True}
 
                 problems = [optimization_problem]
-                best_uppers = [optimization_problem.upper_bound + (c.T @ self.b2)[0]]
-                best_lowers = [optimization_problem.value + (c.T @ self.b2)[0]]
+                if self.bias:
+                    best_uppers = [optimization_problem.upper_bound + (c.T @ self.b2)[0]]
+                    best_lowers = [optimization_problem.value + (c.T @ self.b2)[0]]
+                else:
+                    best_uppers = [optimization_problem.upper_bound]
+                    best_lowers = [optimization_problem.value]
                 solve_times = [optimization_problem.problem.solver_stats.solve_time]
 
                 worst_lower = best_lowers[0]
@@ -1030,6 +1045,8 @@ class CertifiedFragilenessLazy(object):
                         best_upper_bound = np.min(upper_bounds) + (c.T @ self.b2)[0]
                     else:
                         best_upper_bound = np.min(upper_bounds)
+                    if self.deletion:
+                        best_upper_bound = best_upper_bound @ self.del2
                     # print('at step:', step, ', best_uppper_bound:', best_upper_bound, ', worst_lower:', worst_lower)
                     if step > 0:
                         best_uppers.append(best_upper_bound)
@@ -1086,12 +1103,16 @@ class CertifiedFragilenessLazy(object):
             # best_adj_pert - self._adj_norm
             _mask = np.where(self._adj == 1, np.zeros_like(self._adj), np.ones_like(self._adj))
             potential_perturbations = np.multiply(_mask, np.triu(np.abs(self._adj_norm - best_adj_pert), 1))
+
             # Pick top 5 as the perturbations
             sorted_idx = np.argsort(potential_perturbations, axis=None)[::-1][:int(self.args.candidate_size * self.data.num_nodes)]
             pert_indices = np.unravel_index(sorted_idx, potential_perturbations.shape)
             # pert_indices = np.where(potential_perturbations > 0.1)
             adj_diff = potential_perturbations[pert_indices]
             perturbations = np.concatenate(pert_indices).reshape(2, -1).T
+            if perturbations[0][0] == perturbations[0][1] and fragile:
+                # print('!!!', perturbations)
+                fragile = False
 
             if candidates is not None: # map back to the original node index
                 perturbations = np.array([(idx2node[i], idx2node[j]) for i, j in perturbations])

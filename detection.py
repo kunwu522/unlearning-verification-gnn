@@ -18,6 +18,8 @@ import random
 import pickle
 import argparse
 import statistics
+import itertools
+import networkx as nx
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -29,7 +31,8 @@ from torch.utils.data import DataLoader
 from sklearn import svm
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
 from tqdm import tqdm
-from torch_geometric.utils import to_undirected, k_hop_subgraph
+from torch_geometric.data import Data
+from torch_geometric.utils import to_undirected, k_hop_subgraph, subgraph, to_networkx, negative_sampling
 
 from model.layers import GraphConvolution
 from model.gcn import GCN
@@ -67,7 +70,7 @@ class LinkPredDetector(object):
         self.device = device
 
     def _train_gcn(self, adv_data):
-        train_links = random.sample(self.data.edges, int(len(self.data.edges) * 0.5))
+        train_links = random.sample(self.data.edge_index.t().tolist(), int(self.data.edge_index.shape[1] * 0.2))
 
         adj = adv_data.adjacency_matrix().to(self.device)
         adj_tilde = torch.eye(adj.shape[0]).to(self.device) + adj
@@ -121,6 +124,8 @@ class LinkPredDetector(object):
         adj_norm = utils.normalize(adj_tilde)
         directed_edge_index = utils.to_directed(adv_data.edge_index)
 
+        challenge_indices = [i for i, e in enumerate(directed_edge_index.t().tolist()) if tuple(e) in challenge_edges or tuple(e)[::-1] in challenge_edges]
+
         # Compute the score for each edge
         # with torch.no_grad():
         #     test_links = torch.tensor(challenge_edges).t().to(self.device).long()
@@ -134,8 +139,18 @@ class LinkPredDetector(object):
         with torch.no_grad():
             output = model(directed_edge_index[0], directed_edge_index[1], adv_data.x.to(self.device), adj_norm).diag()
             scores = output.cpu().detach().numpy()
-            sorted_indices = np.argsort(scores)
-            top_k_edges = directed_edge_index.t()[sorted_indices[:len(challenge_edges)]].numpy()
+        sorted_indices = np.argsort(scores)
+        top_k_edges = directed_edge_index.t()[sorted_indices[:len(challenge_edges)]].numpy()
+
+        challenge_scores = scores[challenge_indices]
+        print('test:', len(challenge_indices))
+        print('25th percentile:', np.percentile(scores, 25), np.mean([s for s in scores if s < np.percentile(scores, 25)]), scores[sorted_indices[:len(challenge_edges)]])
+        print('25th challenge percentile:', np.percentile(challenge_scores, 25), ', mean:', np.mean(challenge_scores), challenge_scores)
+        print('10th percentile:', np.percentile(scores, 10), np.mean([s for s in scores if s < np.percentile(scores, 10)]), scores[sorted_indices[:len(challenge_edges)]])
+        print('10th challenge percentile:', np.percentile(challenge_scores, 10), ', mean:', np.mean(challenge_scores), challenge_scores)
+        print('5th percentile:', np.percentile(scores, 5), np.mean([s for s in scores if s < np.percentile(scores, 5)]), scores[sorted_indices[:len(challenge_edges)]])
+        print('5th challenge percentile:', np.percentile(challenge_scores, 5), ', mean:', np.mean(challenge_scores), challenge_scores)
+
 
         top_k_edges_list = list(map(tuple, top_k_edges.tolist()))
         detection = []
@@ -144,8 +159,8 @@ class LinkPredDetector(object):
                 detection.append(1)
             else:
                 detection.append(0)
-        ratio_edge = np.sum(detection) / len(detection)
-        return ratio_edge >= 0.2
+        # ratio_edge = np.sum(detection) / len(detection)
+        return np.array(detection)
         # return np.sum(detection) / len(challenge_edges)
 
         # with torch.no_grad():
@@ -283,9 +298,10 @@ class OutlierDetector(object):
         self.v_star = v_star
         self.e_star = e_star
 
-    def _compute_feautres(self, adv_data, v):
+    def _compute_features(self, adv_data, v):
         neighbors = list(adv_data.adj_list[v])
-        _x = np.zeros(5)
+        log_betweenness = np.log(self.betweenness[v] + 1e-9)
+        _x = np.zeros(6)
         uni_classes, counts = np.unique(adv_data.y[neighbors].cpu().numpy(), return_counts=True)
         sorted_counts = np.sort(counts)[::-1]
         _x[0] = len(uni_classes)
@@ -293,12 +309,13 @@ class OutlierDetector(object):
         _x[2] = sorted_counts[0] if len(sorted_counts) > 0 else 0
         _x[3] = sorted_counts[1] if len(sorted_counts) > 1 else 0
         _x[4] = np.std(counts) if len(counts) > 0 else 0
+        _x[5] = log_betweenness
         return _x
 
     def detect(self, v, es):
         """ 1. number of different clases in the neighbours
             2. average appearance time of each class in the neighbours
-            3. appeearance time of the most frequently appeared class in the neighbours
+            3. appearance time of the most frequently appeared class in the neighbours
             4. appearance time of the second most frequently appeared class in the neighbour
             5. standard deviation of the appearance time of each class in the neighbours
         """
@@ -313,8 +330,8 @@ class OutlierDetector(object):
         num_edges = directed_edge_index.shape[1]
         train_features = np.zeros((num_edges, 10))
         for i, (a, b) in enumerate(directed_edge_index.t().cpu().tolist()):
-            train_features[i, :5] = self._compute_feautres(adv_data, a)
-            train_features[i, 5:] = self._compute_feautres(adv_data, b)
+            train_features[i, :5] = self._compute_features(adv_data, a)
+            train_features[i, 5:] = self._compute_features(adv_data, b)
 
         # Train a one-class SVM
         clf = svm.OneClassSVM(gamma='scale').fit(train_features)
@@ -328,8 +345,8 @@ class OutlierDetector(object):
         for i, (a, b) in enumerate(edges):
             if (a, b) in checked_edges or (b, a) in checked_edges:
                 continue
-            test_features[i, :5] = self._compute_feautres(adv_data, a)
-            test_features[i, 5:] = self._compute_feautres(adv_data, b)
+            test_features[i, :5] = self._compute_features(adv_data, a)
+            test_features[i, 5:] = self._compute_features(adv_data, b)
             if (a, b) in challenge_edges or (b, a) in challenge_edges:
                 challenge_edges_indices.append(i)
             checked_edges.add((a, b))
@@ -414,18 +431,18 @@ class OutlierDetector(object):
         num_edges = directed_edge_index.shape[1]
         train_features = np.zeros((num_edges, 10))
         for i, (a, b) in enumerate(directed_edge_index.t().cpu().tolist()):
-            train_features[i, :5] = self._compute_feautres(adv_data, a)
-            train_features[i, 5:] = self._compute_feautres(adv_data, b)
+            train_features[i, :5] = self._compute_features(adv_data, a)
+            train_features[i, 5:] = self._compute_features(adv_data, b)
         for i, (a, b) in enumerate(es):
-            train_features[i, :5] = self._compute_feautres(adv_data, a)
-            train_features[i, 5:] = self._compute_feautres(adv_data, b)
+            train_features[i, :5] = self._compute_features(adv_data, a)
+            train_features[i, 5:] = self._compute_features(adv_data, b)
         
         clf = svm.OneClassSVM(gamma='scale').fit(train_features) 
         # Compute the score for each edge
         test_features = np.zeros((len(es), 10)) 
         for i, (a, b) in enumerate(es):
-            test_features[i, :5] = self._compute_feautres(adv_data, a)
-            test_features[i, 5:] = self._compute_feautres(adv_data, b) 
+            test_features[i, :5] = self._compute_features(adv_data, a)
+            test_features[i, 5:] = self._compute_features(adv_data, b) 
         scores = clf.predict(test_features)
         
         return np.sum(scores == 1) > len(es) * 0.5
@@ -443,37 +460,59 @@ class OutlierDetector(object):
         adv_data = copy.deepcopy(self.data)
         adv_data.add_edges(to_undirected(torch.tensor(challenge_edges).t()))
 
+        data = Data(edge_index=adv_data.edge_index, num_nodes=adv_data.num_nodes)
+        G = to_networkx(data)
+        self.betweenness = nx.betweenness_centrality(G)
+
         # all edges
         directed_edge_index = utils.to_directed(adv_data.edge_index)
-        num_edges = directed_edge_index.shape[1]
-        train_features = np.zeros((num_edges, 10))
-        for i, (a, b) in enumerate(directed_edge_index.t().cpu().tolist()):
-            train_features[i, :5] = self._compute_feautres(adv_data, a)
-            train_features[i, 5:] = self._compute_feautres(adv_data, b)
+        # train_edges = random.sample(directed_edge_index.t().cpu().tolist(), int(directed_edge_index.shape[1] * 0.2))
+        train_edges = directed_edge_index.t().cpu().tolist()
+        num_edges = len(train_edges)
+        train_features = np.zeros((num_edges, 12))
+        for i, (a, b) in enumerate(train_edges):
+            # if (a, b) in challenge_edges or (b, a) in challenge_edges:
+            #     continue
+            train_features[i, :6] = self._compute_features(adv_data, a)
+            train_features[i, 6:] = self._compute_features(adv_data, b)
 
         # Train a one-class SVM
-        clf = svm.OneClassSVM(gamma='scale').fit(train_features)
+        clf = svm.OneClassSVM(gamma='auto').fit(train_features)
 
         # all edges with scores
         # Compute the score for each edge
         edges = [tuple(e) for e in directed_edge_index.t().cpu().tolist()]
-        test_features = np.zeros((len(edges), 10)) 
+        test_features = np.zeros((len(edges), 12)) 
         challenge_edges_indices = []
-        checked_edges = set()
+        # checked_edges = set()
         for i, (a, b) in enumerate(edges):
-            if (a, b) in checked_edges or (b, a) in checked_edges:
-                continue
-            test_features[i, :5] = self._compute_feautres(adv_data, a)
-            test_features[i, 5:] = self._compute_feautres(adv_data, b)
+            # if (a, b) in checked_edges or (b, a) in checked_edges:
+            #     continue
+            test_features[i, :6] = self._compute_features(adv_data, a)
+            test_features[i, 6:] = self._compute_features(adv_data, b)
             if (a, b) in challenge_edges or (b, a) in challenge_edges:
                 challenge_edges_indices.append(i)
-            checked_edges.add((a, b))
+            # checked_edges.add((a, b))
         scores = clf.score_samples(test_features)
+        true_scores = clf.decision_function(test_features)
         # print('challenge edges scores:', scores[challenge_edges_indices])
         # print('the number of scores that are 1:', np.sum(scores == 1))
         # return np.sum(scores == 1) / len(scores)
-        sorted_indices = np.argsort(scores)[::-1]
+        sorted_indices = np.argsort(scores)
+        # sorted_indices = np.argsort(scores)[::-1]
         top_k_edges = directed_edge_index.t().numpy()[sorted_indices[:len(challenge_edges)]]
+
+        # print('top k edges:', scores[sorted_indices[:len(challenge_edges)]], top_k_edges)
+        # print('challenge edges:', scores[challenge_edges_indices])
+
+        # print('top k edge features:', test_features[sorted_indices[:len(challenge_edges)]])
+        # print('challenge edge features:', test_features[challenge_edges_indices])
+        print('25th percentile:', np.percentile(true_scores, 25), np.mean([s for s in true_scores if s < np.percentile(true_scores, 25)]), true_scores[sorted_indices[:len(challenge_edges)]])
+        print('25th challenge percentile:', np.percentile(true_scores[challenge_edges_indices], 25), ', mean:', np.mean(true_scores[challenge_edges_indices]), scores[challenge_edges_indices])
+        print('10th percentile:', np.percentile(true_scores, 10), np.mean([s for s in scores if s < np.percentile(true_scores, 10)]))
+        print('10th challenge percentile:', np.percentile(true_scores[challenge_edges_indices], 10), ', mean:', )
+        print('5th percentile:', np.percentile(true_scores, 5), np.mean([s for s in true_scores if s < np.percentile(true_scores, 5)]))
+        print('5th challenge percentile:', np.percentile(true_scores[challenge_edges_indices], 5), ', mean:', )
 
         # only challenge edges
         # test_features = np.zeros((len(challenge_edges), 10))
@@ -491,8 +530,9 @@ class OutlierDetector(object):
             else:
                 detection.append(0)
         ratio_edge = np.sum(detection) / len(detection)
-        return ratio_edge >= 0.2
+        # return ratio_edge >= 0.2
         # return np.sum(detection) / len(challenge_edges)
+        return np.array(detection)
 
         # with torch.no_grad():
         #     output = model(directed_edge_index[0], directed_edge_index[1], adv_data.x.to(self.device), adj_norm).diag()
@@ -722,7 +762,7 @@ class ProximityDetector(object):
             #     detection.append(1)
             # else:
             #     detection.append(0)
-        return 0, np.sum(detection) / len(detection), escaped_nodes
+        return np.array(detection)
 
         # print('Method: Jaccard Similarity')
         # print('number of nodes:', len(detection))
@@ -787,127 +827,243 @@ class GraphGenDetect(object):
         self.device = device
 
     def _train_generation_model(self, adv_data, subgraphs):
-
-        model = GGD(self.data.num_features, 32, 16, dropout=0.5).to(self.device)
+        model = GGD(self.data.num_features, 64, 64, dropout=0.5).to(self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        criterion = nn.BCELoss()
+        criterion = nn.BCELoss(reduction='sum')
 
         model6_15 = []
-        for e in tqdm(range(6), desc='Training GGD'):
-            pi_list = []
-            max_num_edges = 0
-            for subset, edge_index in subgraphs:
+        for epoch in tqdm(range(15), desc='Training GGD'):
+            model.to(self.device)
+            # _subgraphs = random.sample(subgraphs, 1000)
+            # losses = 0
+            for i, (target, subset, edge_index) in tqdm(enumerate(subgraphs), total=len(subgraphs)):
+                # if edge_index.size(1) <= t:
+                #     continue
+
+                # pi = pi_list[i]
+                # if len(subset) > 100:
+                #     # _node, _edges = len(subset), edge_index.size(1)
+                #     subset, edge_index = self._random_reduce_subgraph_size(subset, edge_index, 100)
+                #     # print(f'subsampled the subgraph from {_node} to {len(subset)}, edge: from {_edges} to {edge_index.size(1)}')
+
+                if len(subset) > 2:
+                    neg_edge_index = negative_sampling(edge_index, num_nodes=subset.size(0), num_neg_samples=edge_index.size(1))
+                else:
+                    neg_edge_index = None
+
                 pi = torch.randperm(edge_index.size(1))
-                pi_list.append(pi)
-                max_num_edges = max(max_num_edges, edge_index.size(1))
-            # print('max_num_edges:', max_num_edges)
-            
-            max_num_edges = min(max_num_edges, 10)
-            for t in range(max_num_edges):
+                predicted_edges = []
                 losses = 0
-                for i, (subset, edge_index) in enumerate(subgraphs):
-                    if edge_index.size(1) <= t:
-                        continue
-                    
-                    pi = pi_list[i]
+                for t in range(edge_index.size(1)):
+                    t0 = time.time()
                     adj = torch.zeros(subset.size(0), subset.size(0), device=self.device)
-                    adj[edge_index[0, pi[:t]], edge_index[1, pi[:t]]] = 1
-                    adj = adj + adj.t()
+                    if t > 0:
+                        adj[edge_index[0, pi[:t]], edge_index[1, pi[:t]]] = 1 
+                        # adj[
+                        #     torch.tensor(predicted_edges).t()[0, :], 
+                        #     torch.tensor(predicted_edges).t()[1, :]
+                        # ] = 1
+                        adj = adj + adj.t()
                     adj_tilde = torch.eye(adj.size(0)).to(self.device) + adj
                     adj_norm = utils.normalize(adj_tilde)
 
                     # Train a GCN to obtain embeddings
                     x = adv_data.x[subset].to(self.device)
 
-                    node_pairs = []
-                    labels = []
-                    true_edges = list(map(tuple, edge_index[:, pi[t:]].t().tolist()))
-                    for m in range(len(subset)):
-                        for n in range(m + 1, len(subset)):
-                            node_pairs.append((m, n))
-                            if (m, n) in true_edges or (n, m) in true_edges:
-                                labels.append(1)
-                            else:
-                                labels.append(0)
-                    node_pairs = torch.tensor(node_pairs, device=self.device).t()
-                    labels = torch.tensor(labels, device=self.device, dtype=torch.float32)
+                    true_edge_index = edge_index[:, pi[t:]]
+                    if neg_edge_index is not None:
+                        train_edge_index = torch.cat([true_edge_index, neg_edge_index], dim=1)
+                        labels = [1] * true_edge_index.size(1) + [0] * neg_edge_index.size(1)
+                    else: 
+                        train_edge_index = true_edge_index
+                        labels = [1] * true_edge_index.size(1)
+                    labels = torch.tensor(labels, dtype=torch.float32).to(self.device)
 
-                    scores = model(node_pairs[0], node_pairs[1], x, adj_norm)
-                    # loss = criterion(F.softmax(scores, dim=0), labels)
+                    scores = model(train_edge_index[0], train_edge_index[1], x, adj_norm)
                     loss = criterion(torch.sigmoid(scores), labels)
+                    losses += loss
                     # loss.backward()
                     # optimizer.step()
                     # optimizer.zero_grad()
-                    losses += loss
-                    # losses.append(loss.cpu().item())
-                # l = torch.mean(losses)
-                l = losses / len(subgraphs)
-                l.backward()
+
+                    # top_pair = torch.argmax(scores).cpu().item()
+                    # predicted_edges.append(node_pairs[top_pair])
+                    # if time.time() - t0 > 30:
+                    #     print(f'subset size: {len(subset)}, edge index: {edge_index.size(1)}, time: {time.time() - t0}')
+                # losses /= len(subgraphs)
+                losses.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-                # print(f'loss: {l.cpu().item()}')
-            # if e >= 6:
-            #     model6_15.append(copy.deepcopy(model))
-        return model
-                        
-    def _check_edges(self, adv_data, subgraphs, model, edges_to_check):
-        scores = defaultdict(dict)
-        pi_list = []
-        max_num_edges = 0
-        for _, edge_index in subgraphs:
-            pi_list.append(torch.randperm(edge_index.size(1)))
-            max_num_edges = max(max_num_edges, edge_index.size(1)) 
+            if epoch >= 5:
+                model6_15.append(copy.deepcopy(model))
+            torch.save(model.cpu().state_dict(), f'ggd_citeseer_{epoch}.pt')
+        return model6_15
+    
+    def calculate_edge_scores(self, adv_data, subgraphs, models):
+        scores = {}
+        for i, (target, subset, edge_index) in tqdm(enumerate(subgraphs), total=len(subgraphs), desc='Calculating edge scores'):
+            pi = torch.randperm(edge_index.size(1))
+            # node2idx = {v: i for i, v in enumerate(subset.tolist())}
+            idx2node = {i: v for i, v in enumerate(subset.tolist())}
 
-        for t in range(max_num_edges):
-            for i, (subset, edge_index) in enumerate(subgraphs):
-                if edge_index.size(1) <= t:
-                    continue
-                node2idx = {v: i for i, v in enumerate(subset.tolist())}
-                idx2node = {i: v for i, v in enumerate(subset.tolist())}
-                pi = pi_list[i]
-
-                containing_edges = []
-                for u, v in edges_to_check:
-                    if u not in node2idx or v not in node2idx:
-                        continue
-                    logits = torch.isin(edge_index[:, pi[t:]], torch.tensor([node2idx[u], node2idx[v]]))
-                    if torch.sum(torch.logical_and(logits[0], logits[1])) > 0:
-                        containing_edges.append((u, v))
-
-                if len(containing_edges) == 0:
-                    continue
-
-                adj = torch.zeros(subset.size(0), subset.size(0), device=self.device)
-                adj[edge_index[0, pi[:t]], edge_index[1, pi[:t]]] = 1
-                adj = adj + adj.t()
+            for t in range(edge_index.size(1)):
+                adj = torch.zeros(len(subset), len(subset), device=self.device)
+                if t > 0:
+                    adj[edge_index[0, pi[:t]], edge_index[1, pi[:t]]] = 1
+                    adj = adj + adj.t()
                 adj_tilde = torch.eye(adj.size(0)).to(self.device) + adj
                 adj_norm = utils.normalize(adj_tilde)
 
                 x = adv_data.x[subset].to(self.device)
-                with torch.no_grad():
-                    output = model(edge_index[0], edge_index[1], x, adj_norm)
-                    # outputs = []
-                    # for m in model_6_15:
-                    #     m.eval()
-                    #     output = m(edge_index[0], edge_index[1], x, adj_norm)
-                    #     outputs.append(output)
-                    # output = torch.stack(outputs, dim=0).mean(dim=0)
+                outputs = []
+                for model in models:
+                    model.to(self.device)
+                    model.eval()
+                    with torch.no_grad():
+                        output = model(edge_index[0, pi[t:]], edge_index[1, pi[t:]], x, adj_norm)
+                        outputs.append(output)
+                outputs = torch.mean(torch.stack(outputs), dim=0)
                 for j, (u, v) in enumerate(edge_index[:, pi[t:]].t().tolist()):
                     _u, _v = idx2node[u], idx2node[v]
-                    if (_u, _v) in containing_edges or (_v, _u) in containing_edges:
-                        _e = tuple(sorted([_u, _v]))
-                        if i not in scores[_e]:
-                            scores[_e][i] = []
-                        scores[(_e)][i].append(torch.sigmoid(output[pi[t:]][j]).cpu().item())
-        result = []
-        for u, v in edges_to_check:
-            _e = tuple(sorted([u, v]))
+                    e = tuple(sorted([_u, _v]))
+                    if e not in scores:
+                        scores[e] = defaultdict(list)
+                    scores[e][i].append(torch.sigmoid(outputs[j]).cpu().item())
+
+        result = {}
+        for e, s1 in scores.items():
             tmp = []
-            for _, s in scores[_e].items():
-                tmp.append(np.mean(s))
-            result.append(statistics.harmonic_mean(tmp))
-            # result.append(np.mean(tmp))
+            for _, s2 in s1.items():
+                tmp.append(np.mean(s2))
+            # result[e] = statistics.harmonic_mean(tmp)
+            result[e] = np.mean(tmp)
         return result
+
+    # def _train_generation_model(self, adv_data, subgraphs):
+    #     model = GGD(self.data.num_features, 32, 16, dropout=0.5).to(self.device)
+    #     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    #     criterion = nn.BCELoss()
+
+    #     model6_15 = []
+    #     for e in tqdm(range(6), desc='Training GGD'):
+    #         pi_list = []
+    #         max_num_edges = 0
+
+    #         _subgraphs = []
+    #         for subset, edge_index in subgraphs:
+    #             if len(subset) > 200:
+    #                 subset, edge_index = self._random_reduce_subgraph_size(subset, edge_index, 200)
+    #             _subgraphs.append((subset, edge_index))
+    #             pi = torch.randperm(edge_index.size(1))
+    #             pi_list.append(pi)
+    #             max_num_edges = max(max_num_edges, edge_index.size(1))
+    #         # print('max_num_edges:', max_num_edges)
+            
+    #         max_num_edges = min(max_num_edges, 10)
+    #         for t in range(max_num_edges):
+    #             losses = 0
+    #             for i, (subset, edge_index) in enumerate(_subgraphs):
+    #                 if edge_index.size(1) <= t:
+    #                     continue
+ 
+    #                 pi = pi_list[i]
+    #                 adj = torch.zeros(subset.size(0), subset.size(0), device=self.device)
+    #                 adj[edge_index[0, pi[:t]], edge_index[1, pi[:t]]] = 1
+    #                 adj = adj + adj.t()
+    #                 adj_tilde = torch.eye(adj.size(0)).to(self.device) + adj
+    #                 adj_norm = utils.normalize(adj_tilde)
+
+    #                 # Train a GCN to obtain embeddings
+    #                 x = adv_data.x[subset].to(self.device)
+
+    #                 node_pairs = []
+    #                 labels = []
+    #                 true_edges = list(map(tuple, edge_index[:, pi[t:]].t().tolist()))
+    #                 for m in range(len(subset)):
+    #                     for n in range(m + 1, len(subset)):
+    #                         node_pairs.append((m, n))
+    #                         if (m, n) in true_edges or (n, m) in true_edges:
+    #                             labels.append(1)
+    #                         else:
+    #                             labels.append(0)
+    #                 node_pairs = torch.tensor(node_pairs, device=self.device).t()
+    #                 labels = torch.tensor(labels, device=self.device, dtype=torch.float32)
+    #                 scores = model(node_pairs[0], node_pairs[1], x, adj_norm)
+    #                 # loss = criterion(F.softmax(scores, dim=0), labels)
+    #                 loss = criterion(torch.sigmoid(scores), labels)
+    #                 # loss.backward()
+    #                 # optimizer.step()
+    #                 # optimizer.zero_grad()
+    #                 losses += loss
+    #                 # losses.append(loss.cpu().item())
+    #             # l = torch.mean(losses)
+    #             l = losses / len(subgraphs)
+    #             l.backward()
+    #             optimizer.step()
+    #             optimizer.zero_grad()
+    #             # print(f'loss: {l.cpu().item()}')
+    #         # if e >= 6:
+    #         #     model6_15.append(copy.deepcopy(model))
+    #     return model
+                        
+    # def _check_edges(self, adv_data, subgraphs, model, edges_to_check):
+    #     scores = defaultdict(dict)
+    #     pi_list = []
+    #     max_num_edges = 0
+    #     for _, edge_index in subgraphs:
+    #         pi_list.append(torch.randperm(edge_index.size(1)))
+    #         max_num_edges = max(max_num_edges, edge_index.size(1)) 
+
+    #     for t in range(max_num_edges):
+    #         for i, (subset, edge_index) in enumerate(subgraphs):
+    #             if edge_index.size(1) <= t:
+    #                 continue
+    #             node2idx = {v: i for i, v in enumerate(subset.tolist())}
+    #             idx2node = {i: v for i, v in enumerate(subset.tolist())}
+    #             pi = pi_list[i]
+
+    #             containing_edges = []
+    #             for u, v in edges_to_check:
+    #                 if u not in node2idx or v not in node2idx:
+    #                     continue
+    #                 logits = torch.isin(edge_index[:, pi[t:]], torch.tensor([node2idx[u], node2idx[v]]))
+    #                 if torch.sum(torch.logical_and(logits[0], logits[1])) > 0:
+    #                     containing_edges.append((u, v))
+
+    #             if len(containing_edges) == 0:
+    #                 continue
+
+    #             adj = torch.zeros(subset.size(0), subset.size(0), device=self.device)
+    #             adj[edge_index[0, pi[:t]], edge_index[1, pi[:t]]] = 1
+    #             adj = adj + adj.t()
+    #             adj_tilde = torch.eye(adj.size(0)).to(self.device) + adj
+    #             adj_norm = utils.normalize(adj_tilde)
+
+    #             x = adv_data.x[subset].to(self.device)
+    #             with torch.no_grad():
+    #                 output = model(edge_index[0], edge_index[1], x, adj_norm)
+    #                 # outputs = []
+    #                 # for m in model_6_15:
+    #                 #     m.eval()
+    #                 #     output = m(edge_index[0], edge_index[1], x, adj_norm)
+    #                 #     outputs.append(output)
+    #                 # output = torch.stack(outputs, dim=0).mean(dim=0)
+    #             for j, (u, v) in enumerate(edge_index[:, pi[t:]].t().tolist()):
+    #                 _u, _v = idx2node[u], idx2node[v]
+    #                 if (_u, _v) in containing_edges or (_v, _u) in containing_edges:
+    #                     _e = tuple(sorted([_u, _v]))
+    #                     if i not in scores[_e]:
+    #                         scores[_e][i] = []
+    #                     scores[(_e)][i].append(torch.sigmoid(output[pi[t:]][j]).cpu().item())
+    #     result = []
+    #     for u, v in edges_to_check:
+    #         _e = tuple(sorted([u, v]))
+    #         tmp = []
+    #         for _, s in scores[_e].items():
+    #             tmp.append(np.mean(s))
+    #         result.append(statistics.harmonic_mean(tmp))
+    #         # result.append(np.mean(tmp))
+    #     return result
 
     def _sample_subgraphs(self, adv_data):
         subgraphs = []
@@ -915,8 +1071,21 @@ class GraphGenDetect(object):
             subset, edge_index, _, _ = k_hop_subgraph(v, 2, adv_data.edge_index, relabel_nodes=True)
             if edge_index.size(1) == 0:
                 continue
-            subgraphs.append((subset, utils.to_directed(edge_index)))
+            subgraphs.append((v, subset, utils.to_directed(edge_index)))
         return subgraphs
+    
+    def _random_reduce_subgraph_size(self, nodes, edge_index, subset_size):
+        # mapped_edge_indices = {v: i for i, v in enumerate(subset.tolist())}
+        # indices = torch.randperm(len(nodes))[:subset_size]
+        # subset = nodes[indices]
+        # subset_indices = [mapped_edge_indices[v] for v in subset]
+        # mask = torch.isin(edge_index[0], subset_indices) & torch.isin(edge_index[1], subset_indices)
+        # sampled_edge_index = edge_index[:, mask]
+
+        indices = random.sample(range(len(nodes)), subset_size)
+        _edge_index = subgraph(indices, edge_index,  relabel_nodes=True)[0]
+
+        return nodes[indices], _edge_index
 
 
     def detect(self):
@@ -936,6 +1105,33 @@ class GraphGenDetect(object):
             model = self._train_generation_model(adv_data, subgraphs)
             scores = self._check_edges(adv_data, subgraphs, model, challenge_edges)
             print(scores)
+
+    def analyze(self):
+        challenge_edges = [tuple(e) for ee in self.e_star for e in ee]
+        challenge_edges = list(set(challenge_edges))
+
+        adv_data = copy.deepcopy(self.data)
+        adv_data.add_edges(to_undirected(torch.tensor(challenge_edges).t()))
+
+        subgraphs = self._sample_subgraphs(adv_data)
+        count = defaultdict(int)
+        for u, v in challenge_edges:
+            for _, subset, edge_index in subgraphs:
+                if u in subset and v in subset:
+                    count[(u, v)] += 1
+        print('challenge edges:', np.mean(list(count.values())), np.max(list(count.values())), np.min(list(count.values())))
+
+        benign_count = defaultdict(int)
+        for u, v in tqdm(self.data.edge_index.t().tolist()):
+            for _, subset, edge_index in subgraphs:
+                if u in subset and v in subset:
+                    benign_count[(u, v)] += 1
+        print('benign edges:', np.mean(list(benign_count.values())), np.max(list(benign_count.values())), np.min(list(benign_count.values())))
+
+        print('benign distribution:', np.unique(list(benign_count.values()), return_counts=True))
+        print('challenge distribution:', np.unique(list(count.values()), return_counts=True))
+        
+        
     
     def detect_all(self):
         challenge_edges = [tuple(e) for ee in self.e_star for e in ee if e[0] != e[1]]
@@ -944,18 +1140,38 @@ class GraphGenDetect(object):
         adv_data = copy.deepcopy(self.data)
         adv_data.add_edges(to_undirected(torch.tensor(challenge_edges).t()))
 
-        all_edges = [tuple(e) for e in adv_data.edge_index.t().tolist()]
+        # all_edges = [tuple(e) for e in adv_data.edge_index.t().tolist()]
 
-        subgraphs = self._sample_subgraphs(adv_data)
-        model = self._train_generation_model(adv_data, subgraphs)
-        challenge_edges_scores = self._check_edges(adv_data, subgraphs, model, challenge_edges)
-        print('Method: Graph Generation Detection')
-        print('number of edges:', len(challenge_edges))
-        print('scores:', challenge_edges_scores)
+        self.subgraphs = self._sample_subgraphs(adv_data)
+        model = self._train_generation_model(adv_data, self.subgraphs)
+        # challenge_edges_scores = self._check_edges(adv_data, subgraphs, model, challenge_edges)
+        # print('Method: Graph Generation Detection')
+        # print('number of edges:', len(challenge_edges))
+        # print('scores:', challenge_edges_scores)
 
-        scores = self._check_edges(adv_data, subgraphs, model, all_edges)
-        sorted_indices = np.argsort(scores)[:len(challenge_edges)]
-        top_k_edges = adv_data.edge_index.t()[sorted_indices].tolist()
+        # scores = self._check_edges(adv_data, subgraphs, model, all_edges)
+        scores = self.calculate_edge_scores(adv_data, self.subgraphs, model)
+        # with open('subgraphs.pkl', 'wb') as f:
+        #     pickle.dump(subgraphs, f)
+        # with open('ggd_scores.pkl', 'wb') as f:
+        #     pickle.dump(scores, f)
+        # with open('challenge_edges.pkl', 'wb') as f:
+        #     pickle.dump(challenge_edges, f)
+        sorted_edges = dict(sorted(scores.items(), key=lambda item:item[1], reverse=False))
+        challenge_scores = [scores[tuple(sorted(e))] for e in challenge_edges]
+        _scores = list(scores.values())
+        print('challenge edge scores:', [scores[tuple(sorted(e))] for e in challenge_edges])
+        print(f'top {len(challenge_edges)} edge scores:', list(sorted_edges.values())[:len(challenge_edges)])
+        print('25th percentile:', np.percentile(_scores, 25), np.mean([s for s in _scores if s < np.percentile(_scores, 25)]))
+        print('25th challenge percentile:', np.percentile(challenge_scores, 25), ', mean:', np.mean(challenge_scores))
+        print('10th percentile:', np.percentile(_scores, 10), np.mean([s for s in _scores if s < np.percentile(_scores, 10)]))
+        print('10th challenge percentile:', np.percentile(challenge_scores, 10), ', mean:', np.mean(challenge_scores))
+        print('5th percentile:', np.percentile(_scores, 5), np.mean([s for s in _scores if s < np.percentile(_scores, 5)]))
+        print('5th challenge percentile:', np.percentile(challenge_scores, 5), ', mean:', np.mean(challenge_scores))
+
+        # sorted_indices = np.argsort(scores)[:len(challenge_edges)]
+        # top_k_edges = adv_data.edge_index.t()[sorted_indices].tolist()
+        top_k_edges = list(sorted_edges.keys())[:len(challenge_edges)]
         detection = []
         for e in challenge_edges:
             if e in top_k_edges or (e[1], e[0]) in top_k_edges:
@@ -966,7 +1182,8 @@ class GraphGenDetect(object):
         # print('scores', scores)
         # return np.sum(torch.sigmoid(torch.tensor(scores)).numpy() < 0.5) / len(scores)
         # return np.sum(np.array(scores) < 0.2) / len(scores)
-        return np.sum(detection) / len(detection)
+        # return np.sum(detection) / len(detection)
+        return np.array(detection)
     
 
 class JaccardSimilarity(object):
@@ -1014,7 +1231,7 @@ class JaccardSimilarity(object):
             return False
 
     def detect_all(self):
-        challenge_edges = [tuple(e) for ee in self.e_star for e in ee if e[0] != e[1]]
+        challenge_edges = [tuple(e) for ee in self.e_star for e in ee]
         challenge_edges = list(set(challenge_edges))
 
         adv_data = copy.deepcopy(self.data)
@@ -1037,12 +1254,33 @@ class JaccardSimilarity(object):
         
         edges = [tuple(e) for e in utils.to_directed(adv_data.edge_index).t().tolist()]
         jaccard_sim = []
+        challenge_edge_simliarity = {}
         for e in edges:
             u = self.data.x[e[0]].numpy()
             v = self.data.x[e[1]].numpy()
-            jaccard_sim.append(self._jaccard_similarity(u, v))
-        top_k_edges = np.array(edges)[np.array(jaccard_sim) == 0]
+            if torch.unique(self.data.x[e[0]]).size(0) == 2: # binary node features
+                jaccard_sim.append(self._jaccard_similarity(u, v))
+            else:
+                jaccard_sim.append(self._cosine_similarity(u, v))
+            if (e[0], e[1]) in challenge_edges or (e[1], e[0]) in challenge_edges:
+                challenge_edge_simliarity[(e[0], e[1])] = jaccard_sim[-1]
 
+        print('Method: Jaccard Similarity')
+        print('number of edges:', len(challenge_edges))
+        print('number of zeros:', (np.array(jaccard_sim) == 0).sum())
+        print('top 10 jaccard similarity:', np.sort(jaccard_sim)[:len(challenge_edges)])
+        print('challenge edge similarity:', challenge_edge_simliarity)
+
+        # top_k_edges = np.array(edges)[np.array(jaccard_sim) == 0]
+        if (np.array(jaccard_sim) == 0).sum() > len(challenge_edges):
+            top_k_edges = top_k_edges[:len(challenge_edges)]
+        else:
+            sorted_indices = np.argsort(jaccard_sim)[:len(challenge_edges)]
+            top_k_edges = np.array(edges)[sorted_indices][:len(challenge_edges)] 
+
+
+        # sorted_indices = np.argsort(jaccard_sim)
+        # top_k_edges = np.array(edges)[sorted_indices[:len(challenge_edges)]]
         top_k_edges_list = list(map(tuple, top_k_edges.tolist()))
         detection = []
         for e in challenge_edges:
@@ -1050,9 +1288,10 @@ class JaccardSimilarity(object):
                 detection.append(1)
             else:
                 detection.append(0)
-        print('number of edges that are detected:', np.sum(detection))
-        ratio_edge = np.sum(detection) / len(detection)
-        return ratio_edge >= 0.5
+        # print('number of edges that are detected:', np.sum(detection))
+        # ratio_edge = np.sum(detection) / len(detection)
+        # return ratio_edge >= 0.5
+        return np.array(detection)
         nodes, counts = np.unique(top_k_edges.flatten(), return_counts=True)
         malicious_nodes = nodes[counts > 0.5 * len(challenge_edges)]
 
@@ -1107,10 +1346,17 @@ class JaccardSimilarity(object):
         """
         J_u,v = M_11 / (M_01 + M_10 + M_11)
         """
-        M_11 = np.sum(u * v)
-        M_01 = np.sum(u * (1 - v))
-        M_10 = np.sum((1 - u) * v)
-        return M_11 / (M_01 + M_10 + M_11)
+        # a, b = features[n1], features[n2]
+        intersection = np.count_nonzero(u * v)
+        J = intersection * 1.0 / (np.count_nonzero(u) + np.count_nonzero(v) - intersection)
+        return J
+        # M_11 = np.sum(u * v)
+        # M_01 = np.sum(u * (1 - v))
+        # M_10 = np.sum((1 - u) * v)
+        # return M_11 / (M_01 + M_10 - M_11)
+    
+    def _cosine_similarity(self, u, v):
+        return np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

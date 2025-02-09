@@ -30,107 +30,106 @@ import copy
 import json
 import time
 import random
-from functools import reduce
 from tqdm import trange, tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import grad
+# from torch.autograd import grad
 import numpy as np
 import pandas as pd
 import collections
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, roc_auc_score
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_undirected, k_hop_subgraph, negative_sampling
-from scipy.optimize import fmin_ncg, fmin_cg
 
 import utils
 from model.gcn import GCN
+from model.sage import GraphSAGE
 from .hessian import hessian_vector_product
 
 
-def to_vector(v):
-    if isinstance(v, tuple) or isinstance(v, list):
-        # return v.cpu().numpy().reshape(-1)
-        return np.concatenate([vv.cpu().numpy().reshape(-1) for vv in v])
-    else:
-        return v.cpu().numpy().reshape(-1)
+class ConstrainedKmeans:
+    def __init__(self, data_feat, num_clusters, node_threshold, terminate_delta, max_iteration=100):
+        self.data_feat = data_feat
+        self.num_clusters = num_clusters
+        self.node_threshold = node_threshold
+        self.terminate_delta = terminate_delta
+        self.max_iteration = max_iteration
 
+    def initialization(self):
+        centroids = np.random.choice(np.arange(self.data_feat.shape[0]), self.num_clusters, replace=False)
+        self.centroid = {}
+        for i in range(self.num_clusters):
+            self.centroid[i] = self.data_feat[centroids[i]]
 
-def to_list(v, sizes, device):
-    _v = v
-    result = []
-    for size in sizes:
-        total = reduce(lambda a, b: a * b, size)
-        result.append(_v[:total].reshape(size).float().to(device))
-        _v = _v[total:]
-    return tuple(result)
+    def clustering(self):
+        centroid = copy.deepcopy(self.centroid)
+        km_delta = []
 
+        # pbar = tqdm(total=self.max_iteration)
+        # pbar.set_description('Clustering')
 
-def _mini_batch_hvp(x, **kwargs):
-    model = kwargs['model']
-    features = kwargs['features']
-    x_train = kwargs['x_train']
-    y_train = kwargs['y_train']
-    adj = kwargs['adj']
-    damping = kwargs['damping']
-    device = kwargs['device']
-    sizes = kwargs['sizes']
-    p_idx = kwargs['p_idx']
-    # use_torch = kwargs['use_torch']
+        for i in range(self.max_iteration):
+            # print('iteration %s' % (i,))
 
-    x = to_list(x, sizes, device)
-    _hvp = hessian_vector_product(model, features, adj, x_train, y_train, x, device, p_idx)
-    return [(a + damping * b).view(-1) for a, b in zip(_hvp, x)]
+            self._node_reassignment()
+            self._centroid_updating()
 
+            # record the average change of centroids, if the change is smaller than a very small value, then terminate
+            delta = self._centroid_delta(centroid, self.centroid)
+            km_delta.append(delta)
+            centroid = copy.deepcopy(self.centroid)
 
-def _get_fmin_loss_fn(v, **kwargs):
-    device = kwargs['device']
+            if delta <= self.terminate_delta:
+                break
+            # print("delta: %s" % delta)
+        # pbar.close()
+        return self.clusters, km_delta
 
-    def get_fmin_loss(x):
-        x = torch.tensor(x, dtype=torch.float, device=device)
-        hvp = _mini_batch_hvp(x, **kwargs)
-        obj = 0.5 * torch.dot(torch.cat(hvp, dim=0), x) - torch.dot(v, x)
-        return obj.detach().cpu().numpy()
+    def _node_reassignment(self):
+        self.clusters = {}
+        for i in range(self.num_clusters):
+            self.clusters[i] = np.zeros(0, dtype=np.uint64)
 
-    return get_fmin_loss
+        distance = np.zeros([self.num_clusters, self.data_feat.shape[0]])
 
+        for i in range(self.num_clusters):
+            distance[i] = np.sum(np.power((self.data_feat - self.centroid[i]), 2), axis=1)
 
-def _get_fmin_grad_fn(v, **kwargs):
-    device = kwargs['device']
+        sort_indices = np.unravel_index(np.argsort(distance, axis=None), distance.shape)
+        clusters = sort_indices[0]
+        users = sort_indices[1]
+        selected_nodes = np.zeros(0, dtype=np.int64)
+        counter = 0
 
-    def get_fmin_grad(x):
-        x = torch.tensor(x, dtype=torch.float, device=device)
-        hvp = _mini_batch_hvp(x, **kwargs)
-        # return to_vector(hvp - v.view(-1))
-        return (torch.cat(hvp, dim=0) - v).cpu().numpy()
+        while len(selected_nodes) < self.data_feat.shape[0]:
+            cluster = int(clusters[counter])
+            user = users[counter]
+            if self.clusters[cluster].size < self.node_threshold:
+                self.clusters[cluster] = np.append(self.clusters[cluster], np.array(int(user)))
+                selected_nodes = np.append(selected_nodes, np.array(int(user)))
 
-    return get_fmin_grad
+                # delete all the following pairs for the selected user
+                user_indices = np.where(users == user)[0]
+                a = np.arange(users.size)
+                b = user_indices[user_indices > counter]
+                remain_indices = a[np.where(np.logical_not(np.isin(a, b)))[0]]
+                clusters = clusters[remain_indices]
+                users = users[remain_indices]
 
+            counter += 1
 
-def _get_fmin_hvp_fn(v, **kwargs):
-    device = kwargs['device']
+    def _centroid_updating(self):
+        for i in range(self.num_clusters):
+            self.centroid[i] = np.mean(self.data_feat[self.clusters[i].astype(int)], axis=0)
 
-    def get_fmin_hvp(x, p):
-        p = torch.tensor(p, dtype=torch.float, device=device)
-        hvp = _mini_batch_hvp(p, **kwargs)
-        return to_vector(hvp)
-    return get_fmin_hvp
+    def _centroid_delta(self, centroid_pre, centroid_cur):
+        delta = 0.0
+        for i in range(len(centroid_cur)):
+            delta += np.sum(np.abs(centroid_cur[i] - centroid_pre[i]))
 
-
-def _get_cg_callback(v, **kwargs):
-    device = kwargs['device']
-
-    def cg_callback(x):
-        x = torch.tensor(x, dtype=torch.float, device=device)
-        hvp = _mini_batch_hvp(x, **kwargs)
-        obj = 0.5 * torch.dot(torch.cat(hvp, dim=0), x) - torch.dot(v, x)
-        # obj = 0.5 * torch.dot(hvp, x) - torch.dot(v.view(-1), x)
-        # g = to_vector(hvp - v.view(-1))
-        g = (torch.cat(hvp, dim=0) - v).cpu().numpy()
-        print(f'loss: {obj:.4f}, grad: {np.linalg.norm(g):.8f}')
-    return cg_callback
+        return delta
 
 
 class Unlearn(object):
@@ -162,6 +161,8 @@ class Unlearn(object):
         self.adj_norm = utils.normalize(self.adj + torch.eye(self.adj.shape[0], device=self.device))
         self.num_nodes = self.adj.shape[0]
 
+        self.edge_index = torch.cat(torch.where(self.adj > 0)).view(2, -1).to(self.device)
+
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
         np.random.seed(self.seed)
@@ -173,22 +174,31 @@ class Unlearn(object):
     def posterior(self, indices=None):
         raise NotImplementedError("Please implement this function in child class")
     
-    def unlearn(self, edges_to_forget):
+    def unlearn(self, edges_to_forget, return_num_retrain=False):
         raise NotImplementedError("Please implement this function in child class")
 
     def predict(self, target_nodes, use_retrained=False, return_posterior=False):
         raise NotImplementedError("Please implement this function in child class")
+    
+    def _evaluate(self, model, adj):
+        model.eval()
+        with torch.no_grad():
+            outputs = model(self.features, adj)[self.idx_test]
+        y_preds = outputs.argmax(dim=1)
+        y_true = self.labels[self.idx_test].cpu().numpy()
+        result = classification_report(y_true, y_preds.cpu().numpy(), output_dict=True, zero_division=0)
+        return result
 
 class GraphEraser(Unlearn):
 
     def __init__(self, seed, features, adj, labels, 
                  config, device, model_type='gcn', epochs=1000, patience=10,
-                 num_shards=20, partition='blpa', aggragation='lb', verbose=False):
+                 num_shards=20, partition='blpa', aggregation='lb', verbose=False):
         super().__init__(seed, features, adj, labels, config, device, model_type, epochs, verbose)
         self.num_shards = num_shards
-        self.aggragation = aggragation
+        self.aggregation = aggregation
         self.patience = patience
-        # self.aggragation = 'mean'
+        # self.aggregation = 'mean'
 
         # torch.manual_seed(seed)
         # torch.cuda.manual_seed_all(seed)
@@ -198,7 +208,7 @@ class GraphEraser(Unlearn):
         if partition == 'blpa':
             self.shards = self._blpa()
         elif partition == 'bekm':
-            pass
+            self.shards = self._bekm()
         else:
             raise ValueError("Please choose a valid partition method: 'blpa' or 'bekm'")
 
@@ -221,50 +231,60 @@ class GraphEraser(Unlearn):
             model.reset_parameters()
             self._train_shard(shard, model, self.adj)
 
-        if self.aggragation == 'lb': 
+        if self.aggregation == 'lb': 
             _, metrics = self._optimal_aggr(self.idx_test)
-        elif self.aggragation == 'mean':
+        elif self.aggregation == 'mean':
             _, metrics = self._mean_aggr(self.idx_test)
 
         return metrics
 
-    def unlearn(self, edges_to_forget): 
+    def unlearn(self, edges_to_forget, return_num_retrain=False): 
         # remove edges from the adjacency matrix
         self.adj_prime = copy.deepcopy(self.adj)
 
         _edge_index = to_undirected(torch.tensor(edges_to_forget).t())
         # _edge_index = to_undirected(torch.from_numpy(edges_to_forget.T))
+        # print('edge to be removed in adj:', self.adj_prime[_edge_index[0], _edge_index[1]])
         self.adj_prime[_edge_index[0], _edge_index[1]] = 0
+        # print('edge to be removed in adj after:', self.adj_prime[_edge_index[0], _edge_index[1]])
 
         retrain_count = 0
-        self.retrained_models = []
+        self.retrained_models = {}
         for i in range(self.num_shards):
             shard = self.shards[i]
             model = copy.deepcopy(self.models[i])
 
-            shard_nodes = torch.cat([torch.tensor(list(shard), device=self.device), torch.tensor(self.idx_val, device=self.device), torch.tensor(self.idx_test, device=self.device)])
+            shard_nodes = torch.cat([
+                torch.tensor(list(shard), device=self.device), 
+                torch.tensor(self.idx_val, device=self.device), 
+                torch.tensor(self.idx_test, device=self.device)
+            ])
             # check if the shard contains the edges to forget
             logit = np.isin(np.array(edges_to_forget).T, list(shard_nodes.cpu()))
             if (logit[0] & logit[1]).sum() == 0:
-                self.retrained_models.append(model)    
+                self.retrained_models[i] = model
                 continue
             
             # retrain the shard if it contains the edges to forget
+            model.reset_parameters()
             self._train_shard(shard, model, self.adj_prime)
             retrain_count += 1
-            self.retrained_models.append(model)
+            self.retrained_models[i] = model
         
-        print(f'unlearning done. {retrain_count} shards retrained.')
+        # print(f'unlearning done. {retrain_count} shards retrained.')
         _, metrics = self._optimal_aggr(self.idx_test, use_retrained=True)
-        return metrics
+        if return_num_retrain:
+            return metrics, retrain_count
+        else:
+            return metrics
     
     def predict(self, target_nodes, use_retrained=False, return_posterior=False):
-        if self.aggragation == 'lb':
+        if self.aggregation == 'lb':
             posts, _ = self._optimal_aggr(target_nodes, use_retrained=use_retrained)
-        elif self.aggragation == 'mean':
+        elif self.aggregation == 'mean':
             posts, _ = self._mean_aggr(target_nodes)
         else:
-            raise NotImplementedError('Please choose a valid aggragation method: "lb"')
+            raise NotImplementedError('Please choose a valid aggregation method: "lb"')
         y_pred = torch.argmax(posts, dim=1).cpu().numpy()
         if return_posterior:
             return y_pred, posts.detach().cpu()
@@ -272,12 +292,12 @@ class GraphEraser(Unlearn):
             return y_pred
 
     def posterior(self, indices=None, use_retrained=False):
-        if self.aggragation == 'lb':
+        if self.aggregation == 'lb':
             posts, _ = self._optimal_aggr(indices, use_retrained=use_retrained)
-        elif self.aggragation == 'mean':
+        elif self.aggregation == 'mean':
             posts, _ = self._mean_aggr(indices)
         else:
-            raise NotImplementedError('Please choose a valid aggragation method: "lb"')
+            raise NotImplementedError('Please choose a valid aggregation method: "lb"')
 
         return posts
     
@@ -328,12 +348,12 @@ class GraphEraser(Unlearn):
                 model = self.retrained_models[i]
             else:
                 model = self.models[i]
-
-            _shard_nodes = list(shard.union(set(indices)))
+            _shard_nodes = list(shard.union(set(indices + self.idx_val + self.idx_test)))
             node2idx = {node: idx for idx, node in enumerate(_shard_nodes)}
             _indices = [node2idx[node] for node in indices]
 
             _features = self.features[_shard_nodes]
+            _labels = self.labels[_shard_nodes][_indices]
             if use_retrained:
                 _adj = self.adj_prime[_shard_nodes, :][:, _shard_nodes]
             else:
@@ -345,11 +365,13 @@ class GraphEraser(Unlearn):
             posteriors.append(outputs)
 
         aggr_post = alpha[0] * posteriors[0]
+        loss = F.cross_entropy(aggr_post, self.labels[indices])
         for s in range(1, self.num_shards):
             aggr_post += alpha[s] * posteriors[s]
         y_preds = torch.argmax(aggr_post, dim=1)
 
         result = classification_report(_labels.cpu().numpy(), y_preds.cpu().numpy(), output_dict=True, zero_division=0)
+        result['loss'] = loss
         return aggr_post, result
 
 
@@ -362,7 +384,8 @@ class GraphEraser(Unlearn):
         _adj_norm = utils.normalize(_adj + torch.eye(_adj.shape[0]).to(self.device))
         
         posteriors = []
-        for _, model in self.models.items():
+        models = self.retrained_models if use_retrained else self.models
+        for _, model in models.items():
             model.eval()
             with torch.no_grad():
                 _posteriors = model(self.features, _adj_norm)[train_indices]
@@ -396,7 +419,11 @@ class GraphEraser(Unlearn):
         return best_alpha / torch.sum(best_alpha)
 
     def _train_shard(self, shard, model, adj):
-        _shard_nodes = torch.cat((torch.tensor(list(shard), device=self.device), torch.tensor(self.idx_val, device=self.device)))
+        _shard_nodes = torch.cat((
+            torch.tensor(list(shard), device=self.device), 
+            torch.tensor(self.idx_val, device=self.device),
+            torch.tensor(self.idx_test, device=self.device)
+        ))
         _idx_train = list(range(len(shard)))
         _idx_val = list(range(len(shard), len(shard) + len(self.idx_val)))
 
@@ -416,7 +443,8 @@ class GraphEraser(Unlearn):
         trial_count = 0
         best_model_state = model.state_dict()
 
-        for e in range(self.epochs):
+        # for e in range(self.epochs):
+        for e in range(100):
             model.train()
             optimizer.zero_grad()
             output = model(_features, _adj_norm)[_idx_train]
@@ -424,24 +452,24 @@ class GraphEraser(Unlearn):
             loss_train.backward()
             optimizer.step()
 
-            model.eval()
-            with torch.no_grad():
-                output = model(_features, _adj_norm)[_idx_val]
-                loss_val = criterion(output, _labels_val)
-                if torch.isnan(loss_val):
-                    print(output.tolist())
-                    print(_labels_val.tolist())
-                    print(_shard_nodes.tolist())
-                    raise ValueError('Loss is NaN.')
+            # model.eval()
+            # with torch.no_grad():
+            #     output = model(_features, _adj_norm)[_idx_val]
+            #     loss_val = criterion(output, _labels_val)
+            #     if torch.isnan(loss_val):
+            #         print(output.tolist())
+            #         print(_labels_val.tolist())
+            #         print(_shard_nodes.tolist())
+            #         raise ValueError('Loss is NaN.')
 
-            if loss_val < best_valid_loss:
-                best_valid_loss = loss_val
-                trial_count = 0 
-                best_model_state = model.state_dict()
-            else:
-                trial_count += 1
-                if trial_count > self.patience:
-                    break
+            # if loss_val < best_valid_loss:
+            #     best_valid_loss = loss_val
+            #     trial_count = 0 
+            #     best_model_state = model.state_dict()
+            # else:
+            #     trial_count += 1
+            #     if trial_count > self.patience:
+            #         break
 
             # print(f'Epoch {e+1:03d}: train loss {loss_train.item():.4f}, val loss {loss_val.item():.4f}')
         
@@ -502,6 +530,45 @@ class GraphEraser(Unlearn):
                 break
 
         return shards
+    
+    def _node_embeddings(self):
+        embedding_size = self.features.shape[1]
+        _model = GraphSAGE(
+            nfeat=self.features.shape[1], 
+            nhid=embedding_size, 
+            nclass=int(self.labels.max().item() + 1), 
+            dropout=self.config['dropout']
+        ).to(self.device)
+
+        optimizer = torch.optim.Adam(_model.parameters(), lr=self.config['lr'], weight_decay=1e-5)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        for _ in range(100):
+            _model.train()
+            optimizer.zero_grad()
+            output = _model(self.features, self.edge_index)[self.idx_train]
+            loss_train = criterion(output, self.labels[self.idx_train])
+            loss_train.backward()
+            optimizer.step()
+
+        _model.eval()
+        with torch.no_grad():
+            embeddings = _model(self.features, self.edge_index)
+        return embeddings.cpu().numpy()
+
+    def _bekm(self):
+        train_idx = self.idx_train
+        idx_mapping = {idx: node for idx, node in enumerate(train_idx)}
+        node_threshold = math.ceil(len(self.features) / self.num_shards)
+
+        embeddings = self._node_embeddings()[train_idx]
+        cluster = ConstrainedKmeans(embeddings, self.num_shards, node_threshold, 0)
+        cluster.initialization()
+        shards, _ = cluster.clustering()
+        result = {}
+        for i in range(self.num_shards):
+            result[i] = set([idx_mapping[int(s)] for s in shards[i]])
+        return result
 
     def _blpa_determine_desire_move(self, node2shard):
         desire_move = np.zeros([self.num_nodes, 3], dtype=np.int32)
@@ -532,257 +599,6 @@ class GraphEraser(Unlearn):
         return delta
     
 
-class CEU(Unlearn):
-
-    def __init__(self, seed, features, adj, labels, config, device, 
-                 model_type='gcn', epochs=1000, patience=10, damping=0.01,
-                 verbose=False) -> None:
-        super().__init__(seed, features, adj, labels, config, device, model_type, epochs, verbose)
-        self.patience = patience
-        self.damping = 0.01
-
-        if self.model_type.lower() == "gat":
-            self.model = GAT(nfeat=self.features.shape[1],
-                             nhid=self.config['nhid'],
-                             nclass=labels.max().item() + 1,
-                             dropout=self.config['dropout'],
-                             nhead=self.config['nheads'])
-        elif self.model_type.lower() == "gcn":
-            self.model = GCN(nfeat=self.features.shape[1], 
-                             nhid=self.config['nhid'], 
-                             nclass=int(self.labels.max().item() + 1), 
-                             dropout=self.config['dropout']).to(self.device)
-        else:
-            pass
-            # model, enc1, enc2 = init_GraphSAGE(ft, adj, labels.max().item() + 1, config, device)
-            # enc1.to(device)
-            # enc2.to(device)
-
-
-    def train(self):
-        _labels_train = self.labels[self.idx_train]
-        _labels_val = self.labels[self.idx_val]
-        
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['lr'], weight_decay=1e-5)
-        criterion = torch.nn.CrossEntropyLoss()
-
-        best_valid_loss = math.inf
-        trial_count = 0
-        best_model_state = self.model.state_dict()
-
-        for e in range(self.epochs):
-            self.model.train()
-            optimizer.zero_grad()
-            output = self.model(self.features, self.adj_norm)[self.idx_train]
-            loss_train = criterion(output, _labels_train)
-            loss_train.backward()
-            optimizer.step()
-
-            self.model.eval()
-            with torch.no_grad():
-                output = self.model(self.features, self.adj_norm)[self.idx_val]
-                loss_val = criterion(output, _labels_val)
-
-            if loss_val < best_valid_loss:
-                best_valid_loss = loss_val
-                trial_count = 0 
-                best_model_state = self.model.state_dict()
-            else:
-                trial_count += 1
-                if trial_count > self.patience:
-                    break
-
-            # print(f'Epoch {e+1:03d}: train loss {loss_train.item():.4f}, val loss {loss_val.item():.4f}')
-        
-        self.model.load_state_dict(best_model_state)
-
-        # evaluate the learned model
-        return self._evaluate(self.model, self.adj_norm)
-
-
-    def unlearn(self, edges_to_forget):
-        self.retrain_model = copy.deepcopy(self.model)
-        self.adj_prime = copy.deepcopy(self.adj)
-
-        # remove edges from the adjacency matrix
-        _edge_index = to_undirected(torch.tensor(edges_to_forget).t())
-        self.adj_prime[_edge_index[0], _edge_index[1]] = 0
-        self.adj_prime_norm = utils.normalize(self.adj_prime + torch.eye(self.adj_prime.shape[0]).to(self.device))
-
-        infected_nodes = self._infected_nodes(edges_to_forget, 2)
-        infected_nodes = torch.tensor(infected_nodes, device=self.device)
-        infected_labels = self.labels[infected_nodes]
-
-        infl = self._influence(self.retrain_model, self.adj_prime_norm, infected_nodes, infected_labels)
-        self._update_model_weight(self.retrain_model, infl)
-
-        # Evaluate the performance of the retraine model
-        return self._evaluate(self.retrain_model, self.adj_prime)
-    
-    def predict(self, target_nodes, use_retrained=False, return_posterior=False):
-        model = self.retrain_model if use_retrained else self.model
-        adj_norm = self.adj_prime_norm if use_retrained else self.adj_norm
-
-        model.eval()
-        with torch.no_grad():
-            outputs = model(self.features, adj_norm)[target_nodes]
-        y_pred = torch.argmax(outputs, dim=1).cpu().numpy()
-        if return_posterior:
-            return y_pred, outputs.cpu().detach()
-        else:
-            return y_pred
-    
-    def posterior(self, indices=None, use_retrained=False):
-        model = self.retrain_model if use_retrained else self.model
-        adj_norm = self.adj_prime_norm if use_retrained else self.adj_norm
-
-        model.eval()
-        with torch.no_grad():
-            outputs = model(self.features, adj_norm)
-
-        return outputs
-
-    def _evaluate(self, model, adj):
-        model.eval()
-        with torch.no_grad():
-            outputs = model(self.features, adj)[self.idx_test]
-        y_preds = outputs.argmax(dim=1)
-        y_true = self.labels[self.idx_test].cpu().numpy()
-        result = classification_report(y_true, y_preds.cpu().numpy(), output_dict=True, zero_division=0)
-        return result
-
-    def _update_model_weight(self, model, infl):
-        parameters = [p for p in model.parameters() if p.requires_grad]
-        with torch.no_grad():
-            delta = [p + infl for p, infl in zip(parameters, infl)]
-            for i, p in enumerate(parameters):
-                p.copy_(delta[i])
-
-    def _influence(self, model, adj_prime, infected_nodes, infected_labels):
-        parameters = [p for p in model.parameters() if p.requires_grad]
-        # p = 1 / (len(self.idx_train))
-        p = 1 / (len(infected_nodes))
-        # p = 1
-        
-        model.eval()
-        output = model(self.features, adj_prime)[infected_nodes]
-        loss1 = F.nll_loss(output, infected_labels)
-        g1 = grad(loss1, parameters)
-
-        output = model(self.features, self.adj_norm)[infected_nodes]
-        loss2 = F.nll_loss(output, infected_labels)
-        g2 = grad(loss2, parameters)
-
-        v = [gg1 - gg2 for gg1, gg2 in zip(g1, g2)]
-
-        ihvp, (cg_grad, status) = self.inverse_hvp_cg(model, v)
-        I = [- p * i for i in ihvp]
-        return I
-
-    def inverse_hvp_cg(self, model, vs):
-        inverse_hvp = []
-        status, cg_grad = [], []
-
-        parameters = [p for p in model.parameters() if p.requires_grad]
-        for i, (v, p) in enumerate(zip(vs, parameters)):
-            sizes = [p.size()]
-            v = v.view(-1)
-
-            fmin_loss_fn = _get_fmin_loss_fn(v, model=model,
-                                             features = self.features,
-                                             x_train=self.idx_train, y_train=self.labels[self.idx_train],
-                                             adj=self.adj, damping=self.damping,
-                                             sizes=sizes, p_idx=i, device=self.device)
-
-            fmin_grad_fn = _get_fmin_grad_fn(v, model=model,
-                                             features = self.features,
-                                             x_train=self.idx_train, y_train=self.labels[self.idx_train],
-                                             adj=self.adj, damping=self.damping,
-                                             sizes=sizes, p_idx=i, device=self.device)
-            '''fmin_hvp_fn = _get_fmin_hvp_fn(v, model=model,
-                                           features = self.features,
-                                           x_train=self.idx_train, y_train=self.labels[self.idx_train],
-                                           adj=self.adj, damping=self.damping,
-                                           sizes=sizes, p_idx=i, device=self.device)
-            cg_callback = _get_cg_callback(v, model=model,
-                                           features = self.features,
-                                           x_train=self.idx_train, y_train=self.labels[self.idx_train],
-                                           adj=self.adj, damping=self.damping,
-                                           sizes=sizes, p_idx=i, device=self.device)'''
-            res = fmin_cg(
-                f=fmin_loss_fn,
-                x0=to_vector(v),
-                fprime=fmin_grad_fn,
-                gtol=1E-4,
-                # norm='fro',
-                # callback=cg_callback,
-                disp=False,
-                full_output=True,
-                maxiter=100,
-            )
-            #     res = fmin_ncg(
-            #         f=fmin_loss_fn,
-            #         x0=to_vector(v),
-            #         fprime=fmin_grad_fn,
-            #         fhess_p=fmin_hvp_fn,
-            #         # callback=cg_callback,
-            #         avextol=1e-5,
-            #         disp=False,
-            #         full_output=True,
-            #         maxiter=100)
-
-            inverse_hvp.append(to_list(torch.from_numpy(res[0]), sizes, self.device)[0])
-            # inverse_hvp = to_list(torch.from_numpy(res[0]), sizes, device)
-            # cg_grad = np.linalg.norm(fmin_grad_fn(res[0]))
-            # status = res[4]
-            # print('-----------------------------------')
-            # cg_grad.append(np.linalg.norm(fmin_grad_fn(res[0]), ord=np.inf))
-
-            # else:
-            #     res = fmin_ncg(
-            #         f=fmin_loss_fn,
-            #         x0=to_vector(v),
-            #         fprime=fmin_grad_fn,
-            #         fhess_p=fmin_hvp_fn,
-            #         # callback=cg_callback,
-            #         avextol=1e-5,
-            #         disp=False,
-            #         full_output=True,
-            #         maxiter=100)
-            #     inverse_hvp.append(to_list(torch.from_numpy(res[0]), sizes, device)[0])
-                # inverse_hvp = to_list(torch.from_numpy(res[0]), sizes, device)
-
-            #     x, _err, d = fmin_l_bfgs_b(
-            #         func=fmin_loss_fn,
-            #         x0=to_vector(v),
-            #         fprime=fmin_grad_fn,
-            #         iprint=0,
-            #     )
-            #     inverse_hvp.append(to_list(x, sizes, device)[0])
-            #     status.append(d['warnflag'])
-            #     err += _err.item()
-            # print('error:', err, status)
-        return inverse_hvp, (cg_grad, status)
-
-
-    def _infected_nodes(self, edges, l):
-        assert l <= 2, 'Only support 1 or 2 hops GNNs'
-
-        results = []
-        if l == 1:
-            for u, v in edges:
-                results.extend(torch.where(self.adj[[u, v]] == 1)[1].tolist())
-        elif l == 2:
-            adj_2hop = self.adj.float() @ self.adj.float()
-            for u, v in edges:
-                results.extend(torch.where(adj_2hop[[u, v]] == 1)[1].tolist())
-                results.extend([u, v])
-        else:
-            raise NotImplementedError('Only support 1 or 2 hops GNNs')
-
-        return list(set(results))
-    
-
 class DeletionLayer(nn.Module):
     """
     A custom layer that applies deletion operator to the local
@@ -793,9 +609,9 @@ class DeletionLayer(nn.Module):
         super().__init__()
         self.dim = dim
         self.mask = mask
-        self.deletion_weight = nn.Parameter(torch.ones(dim, dim) / 100)
-        # self.deletion_weight = nn.Parameter(torch.eye(dim, dim))
-        # init.xavier_uniform_(self.deletion_weight)
+        # self.deletion_weight = nn.Parameter(torch.ones(dim, dim) / 100)
+        self.deletion_weight = nn.Parameter(torch.zeros(dim, dim), requires_grad=True)
+        torch.nn.init.xavier_uniform_(self.deletion_weight)
     
     def forward(self, x, mask=None):
         '''Only apply deletion operator to the local nodes identified by mask'''
@@ -812,59 +628,67 @@ class DeletionLayer(nn.Module):
         return x
 
 
-class GCN_delete(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, **kwargs):
-        super(GCN_delete, self).__init__()
+class GCNDelete(GCN):
+    def __init__(self, nfeat, nhid, nclass, droput):
+        super(GCNDelete, self).__init__(nfeat, nhid, nclass, droput)
+    # def __init__(self, in_dim, hidden_dim, out_dim, **kwargs):
+    #     super(GCN_delete, self).__init__()
 
-        self.conv1 = GCNConv(in_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, out_dim)
-        # self.dropout = nn.Dropout(args.dropout)
+    #     self.conv1 = GCNConv(in_dim, hidden_dim)
+    #     self.conv2 = GCNConv(hidden_dim, out_dim)
+    #     # self.dropout = nn.Dropout(args.dropout)
 
-    def forward(self, x, edge_index, return_all_emb=False):
-        x1 = self.conv1(x, edge_index)
-        x = F.relu(x1)
-        # x = self.dropout(x)
-        x2 = self.conv2(x, edge_index)
+    # def forward(self, x, edge_index, return_all_emb=False):
+    #     x1 = self.conv1(x, edge_index)
+    #     x = F.relu(x1)
+    #     # x = self.dropout(x)
+    #     x2 = self.conv2(x, edge_index)
 
-        if return_all_emb:
-            return x1, x2
+    #     if return_all_emb:
+    #         return x1, x2
         
-        return x2
+    #     return x2
 
     def decode(self, z, pos_edge_index, neg_edge_index=None):
         if neg_edge_index is not None:
-            edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1)
-            logits = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)
+            edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1).long()
+            # logits = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)
+            logits = torch.cat([z[edge_index[0]], z[edge_index[1]]], dim=-1)
 
         else:
-            edge_index = pos_edge_index
-            logits = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)
+            edge_index = pos_edge_index.long()
+            # logits = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)
+            logits = torch.cat([z[edge_index[0]], z[edge_index[1]]], dim=-1)
 
         return logits
 
-class GCNDelete(GCN_delete):
-    def __init__(self, in_dim, hidden_dim, out_dim, mask_1hop=None, mask_2hop=None):
-        super(GCNDelete, self).__init__(in_dim, hidden_dim, out_dim)
-        self.deletion1 = DeletionLayer(hidden_dim, mask_1hop)
-        self.deletion2 = DeletionLayer(out_dim, mask_2hop)
+class GCNDeletion(GCNDelete):
+    # def __init__(self, in_dim, hidden_dim, out_dim, mask_1hop=None, mask_2hop=None):
+    def __init__(self, nfeat, nhid, nclass, dropout, mask_1hop=None, mask_2hop=None):
+        super(GCNDeletion, self).__init__(nfeat, nhid, nclass, dropout)
+        self.deletion1 = DeletionLayer(nhid, mask_1hop)
+        self.deletion2 = DeletionLayer(nclass, mask_2hop)
 
-        self.conv1.requires_grad = False
-        self.conv2.requires_grad = False
+        # self.gc1.weight.requires_grad = False
+        # self.gc2.bias.requires_grad = False
+        for p in self.gc1.parameters():
+            p.requires_grad_(False)
+        for p in self.gc2.parameters():
+            p.requires_grad_(False)
 
-    def forward(self, x, edge_index, mask_1hop=None, mask_2hop=None, return_all_emb=False):
+    def forward(self, x, adj, mask_1hop=None, mask_2hop=None, return_all_emb=False):
         # with torch.no_grad():
-        x1 = self.conv1(x, edge_index)
+        x1 = self.gc1(x, adj)
         
         x1 = self.deletion1(x1, mask_1hop)
 
         x = F.relu(x1)
         
-        x2 = self.conv2(x, edge_index)
+        x2 = self.gc2(x, adj)
         x2 = self.deletion2(x2, mask_2hop)
 
         if return_all_emb:
             return x1, x2
-        
         return x2
     
     def get_original_embeddings(self, x, edge_index, return_all_emb=False):
@@ -1082,82 +906,84 @@ class Trainer:
         self.trainer_log['training_time'] = np.mean([i['epoch_time'] for i in self.trainer_log['log'] if 'epoch_time' in i])
 
     @torch.no_grad()
-    def eval(self, model, data, stage='val', pred_all=False):
+    def eval(self, model, data, stage='val', pred_all=False, device='cuda'):    
         model.eval()
-        pos_edge_index = data[f'{stage}_pos_edge_index']
-        neg_edge_index = data[f'{stage}_neg_edge_index']
+        pos_idx = random.sample(range(data.edge_index.size(1)), 200)
+        pos_edge_index = data.edge_index[:, pos_idx].to(device)
+        neg_edge_index = negative_sampling(pos_edge_index, data.num_nodes, num_neg_samples=pos_edge_index.size(1)).to(device)
+        mask = data.dr_mask
 
-        if self.args.eval_on_cpu:
-            model = model.to('cpu')
-        
-        if hasattr(data, 'dtrain_mask'):
-            mask = data.dtrain_mask
-        else:
-            mask = data.dr_mask
-        z = model(data.x, data.train_pos_edge_index[:, mask])
-        logits = model.decode(z, pos_edge_index, neg_edge_index).sigmoid()
+        _adj = torch.zeros(data.num_nodes, data.num_nodes)
+        _adj[data.train_pos_edge_index[0, mask], data.train_pos_edge_index[1, mask]] = 1
+        _adj[data.train_pos_edge_index[1, mask], data.train_pos_edge_index[0, mask]] = 1
+        _adj_norm = utils.normalize(_adj + torch.eye(data.num_nodes)).to(device)
+        z = model(data.x.to(device), _adj_norm)
+        # logits = model.decode(z, pos_edge_index, neg_edge_index).sigmoid()
+        _edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1).long()
+        logits = (z[_edge_index[0]] * z[_edge_index[1]]).sum(dim=-1).sigmoid()
         label = self.get_link_labels(pos_edge_index, neg_edge_index)
 
         # DT AUC AUP
         loss = F.binary_cross_entropy_with_logits(logits, label).cpu().item()
-        dt_auc = roc_auc_score(label.cpu(), logits.cpu())
-        dt_aup = average_precision_score(label.cpu(), logits.cpu())
+        val_auc = roc_auc_score(label.cpu(), logits.cpu())
+        # dt_aup = average_precision_score(label.cpu(), logits.cpu())
 
         # DF AUC AUP
-        if self.args.unlearning_model in ['original']:
-            df_logit = []
-        else:
-            # df_logit = model.decode(z, data.train_pos_edge_index[:, data.df_mask]).sigmoid().tolist()
-            df_logit = model.decode(z, data.directed_df_edge_index).sigmoid().tolist()
+        # if self.args.unlearning_model in ['original']:
+        #     df_logit = []
+        # else:
+        #     # df_logit = model.decode(z, data.train_pos_edge_index[:, data.df_mask]).sigmoid().tolist()
+        #     df_logit = model.decode(z, data.directed_df_edge_index).sigmoid().tolist()
 
-        if len(df_logit) > 0:
-            df_auc = []
-            df_aup = []
+        # if len(df_logit) > 0:
+        #     df_auc = []
+        #     df_aup = []
         
-            # Sample pos samples
-            if len(self.df_pos_edge) == 0:
-                for i in range(500):
-                    mask = torch.zeros(data.train_pos_edge_index[:, data.dr_mask].shape[1], dtype=torch.bool)
-                    idx = torch.randperm(data.train_pos_edge_index[:, data.dr_mask].shape[1])[:len(df_logit)]
-                    mask[idx] = True
-                    self.df_pos_edge.append(mask)
+        #     # Sample pos samples
+        #     if len(self.df_pos_edge) == 0:
+        #         for i in range(500):
+        #             mask = torch.zeros(data.train_pos_edge_index[:, data.dr_mask].shape[1], dtype=torch.bool)
+        #             idx = torch.randperm(data.train_pos_edge_index[:, data.dr_mask].shape[1])[:len(df_logit)]
+        #             mask[idx] = True
+        #             self.df_pos_edge.append(mask)
             
-            # Use cached pos samples
-            for mask in self.df_pos_edge:
-                pos_logit = model.decode(z, data.train_pos_edge_index[:, data.dr_mask][:, mask]).sigmoid().tolist()
+        #     # Use cached pos samples
+        #     for mask in self.df_pos_edge:
+        #         pos_logit = model.decode(z, data.train_pos_edge_index[:, data.dr_mask][:, mask]).sigmoid().tolist()
                 
-                logit = df_logit + pos_logit
-                label = [0] * len(df_logit) +  [1] * len(df_logit)
-                df_auc.append(roc_auc_score(label, logit))
-                df_aup.append(average_precision_score(label, logit))
+        #         logit = df_logit + pos_logit
+        #         label = [0] * len(df_logit) +  [1] * len(df_logit)
+        #         df_auc.append(roc_auc_score(label, logit))
+        #         df_aup.append(average_precision_score(label, logit))
         
-            df_auc = np.mean(df_auc)
-            df_aup = np.mean(df_aup)
+        #     df_auc = np.mean(df_auc)
+        #     df_aup = np.mean(df_aup)
 
-        else:
-            df_auc = np.nan
-            df_aup = np.nan
+        # else:
+        #     df_auc = np.nan
+        #     df_aup = np.nan
 
         # Logits for all node pairs
-        if pred_all:
-            logit_all_pair = (z @ z.t()).cpu()
-        else:
-            logit_all_pair = None
+        # if pred_all:
+        #     logit_all_pair = (z @ z.t()).cpu()
+        # else:
+        #     logit_all_pair = None
 
-        log = {
-            f'{stage}_loss': loss,
-            f'{stage}_dt_auc': dt_auc,
-            f'{stage}_dt_aup': dt_aup,
-            f'{stage}_df_auc': df_auc,
-            f'{stage}_df_aup': df_aup,
-            f'{stage}_df_logit_mean': np.mean(df_logit) if len(df_logit) > 0 else np.nan,
-            f'{stage}_df_logit_std': np.std(df_logit) if len(df_logit) > 0 else np.nan
-        }
+        # log = {
+        #     f'{stage}_loss': loss,
+        #     f'{stage}_dt_auc': dt_auc,
+        #     f'{stage}_dt_aup': dt_aup,
+        #     f'{stage}_df_auc': df_auc,
+        #     f'{stage}_df_aup': df_aup,
+        #     f'{stage}_df_logit_mean': np.mean(df_logit) if len(df_logit) > 0 else np.nan,
+        #     f'{stage}_df_logit_std': np.std(df_logit) if len(df_logit) > 0 else np.nan
+        # }
 
-        if self.args.eval_on_cpu:
-            model = model.to(device)
+        # if self.args.eval_on_cpu:
+        #     model = model.to(device)
 
-        return loss, dt_auc, dt_aup, df_auc, df_aup, df_logit, logit_all_pair, log
+        # return loss, dt_auc, dt_aup, df_auc, df_aup, df_logit, logit_all_pair, loga
+        return loss, val_auc
 
     @torch.no_grad()
     def test(self, model, data, model_retrain=None, attack_model_all=None, attack_model_sub=None, ckpt='best'):
@@ -1264,8 +1090,8 @@ def member_infer_attack(target_model, attack_model, data, logits=None, device='c
     
 class GNNDeleteTrainer(Trainer):
 
-    def train(self, model, data, optimizer, args, logits_ori=None, attack_model_all=None, attack_model_sub=None):
-        return self.train_fullbatch(model, data, optimizer, args, logits_ori, attack_model_all, attack_model_sub)
+    def train(self, model, data, retrain_data, optimizer, args, logits_ori=None, attack_model_all=None, attack_model_sub=None):
+        return self.train_fullbatch(model, data, retrain_data, optimizer, args, logits_ori, attack_model_all, attack_model_sub)
         # if 'ogbl' in self.args.dataset:
         #     return self.train_minibatch(model, data, optimizer, args, logits_ori, attack_model_all, attack_model_sub)
 
@@ -1364,11 +1190,13 @@ class GNNDeleteTrainer(Trainer):
 
         return loss, loss_r, loss_l
 
-    def train_fullbatch(self, model, data, optimizer, args, logits_ori=None, attack_model_all=None, attack_model_sub=None):
+    def train_fullbatch(self, model, data, retrain_data, optimizer, args, logits_ori=None, attack_model_all=None, attack_model_sub=None):
         model = model.to(self.device)
         # data = data.to(self.device)
 
         best_metric = 0
+        patience = 0
+        best_state_dict = model.state_dict()
 
         # '''Model naming convention: "gnndelete_random_mse_edgeprob_1_local_mse_edgeprob_1" '''
         # _, _, random_loss_fct, compute_random_on, random_layer, _, local_loss_fct, compute_local_on, local_layer = self.args.unlearning_model.split('_')
@@ -1378,14 +1206,14 @@ class GNNDeleteTrainer(Trainer):
         # neg_size = 10
 
         # MI Attack before unlearning
-        if attack_model_all is not None:
-            mi_logit_all_before, mi_sucrate_all_before = member_infer_attack(model, attack_model_all, data)
-            self.trainer_log['mi_logit_all_before'] = mi_logit_all_before
-            self.trainer_log['mi_sucrate_all_before'] = mi_sucrate_all_before
-        if attack_model_sub is not None:
-            mi_logit_sub_before, mi_sucrate_sub_before = member_infer_attack(model, attack_model_sub, data)
-            self.trainer_log['mi_logit_sub_before'] = mi_logit_sub_before
-            self.trainer_log['mi_sucrate_sub_before'] = mi_sucrate_sub_before
+        # if attack_model_all is not None:
+        #     mi_logit_all_before, mi_sucrate_all_before = member_infer_attack(model, attack_model_all, data)
+        #     self.trainer_log['mi_logit_all_before'] = mi_logit_all_before
+        #     self.trainer_log['mi_sucrate_all_before'] = mi_sucrate_all_before
+        # if attack_model_sub is not None:
+        #     mi_logit_sub_before, mi_sucrate_sub_before = member_infer_attack(model, attack_model_sub, data)
+        #     self.trainer_log['mi_logit_sub_before'] = mi_logit_sub_before
+        #     self.trainer_log['mi_sucrate_sub_before'] = mi_sucrate_sub_before
 
         # All node paris in S_Df without Df
         ## S_Df 1 hop all pair mask
@@ -1402,15 +1230,17 @@ class GNNDeleteTrainer(Trainer):
 
         ## S_Df 2 hop all pair mask
         sdf2_all_pair_mask = torch.zeros(data.num_nodes, data.num_nodes, dtype=torch.bool)
-        idx = torch.combinations(torch.arange(data.num_nodes)[data.sdf_node_2hop_mask], with_replacement=True).t()
-        sdf2_all_pair_mask[idx[0], idx[1]] = True
-        sdf2_all_pair_mask[idx[1], idx[0]] = True
+        # idx = torch.combinations(torch.arange(data.num_nodes)[data.sdf_node_2hop_mask], with_replacement=True).t()
+        # sdf2_all_pair_mask[idx[0], idx[1]] = True
+        # sdf2_all_pair_mask[idx[1], idx[0]] = True
+        sdf2_all_pair_mask[data.two_hop_edge_wo_df[0], data.two_hop_edge_wo_df[1]] = True
+        sdf2_all_pair_mask[data.two_hop_edge_wo_df[1], data.two_hop_edge_wo_df[0]] = True
 
-        assert sdf2_all_pair_mask.sum().cpu() == data.sdf_node_2hop_mask.sum().cpu() * data.sdf_node_2hop_mask.sum().cpu()
+        # assert sdf2_all_pair_mask.sum().cpu() == data.sdf_node_2hop_mask.sum().cpu() * data.sdf_node_2hop_mask.sum().cpu()
 
         ## Remove Df itself
-        sdf2_all_pair_mask[data.train_pos_edge_index[:, data.df_mask][0], data.train_pos_edge_index[:, data.df_mask][1]] = False
-        sdf2_all_pair_mask[data.train_pos_edge_index[:, data.df_mask][1], data.train_pos_edge_index[:, data.df_mask][0]] = False
+        # sdf2_all_pair_mask[data.train_pos_edge_index[:, data.df_mask][0], data.train_pos_edge_index[:, data.df_mask][1]] = False
+        # sdf2_all_pair_mask[data.train_pos_edge_index[:, data.df_mask][1], data.train_pos_edge_index[:, data.df_mask][0]] = False
 
         ## Lower triangular mask
         idx = torch.tril_indices(data.num_nodes, data.num_nodes, -1)
@@ -1441,16 +1271,32 @@ class GNNDeleteTrainer(Trainer):
             model.train()
 
             start_time = time.time()
-            z = model(data.x.to(self.device), data.train_pos_edge_index[:, data.sdf_mask])
+            # _adj = copy.deepcopy(adj)
+            _adj = torch.zeros(data.num_nodes, data.num_nodes)
+            _adj[data.edge_index[0, data.sdf_mask.cpu()], data.edge_index[1, data.sdf_mask.cpu()]] = 1
+            _adj[data.edge_index[1, data.sdf_mask.cpu()], data.edge_index[0, data.sdf_mask.cpu()]] = 1
+            _adj_norm = utils.normalize(_adj.to(self.device) + torch.eye(data.num_nodes, device=self.device))
+
+            _adj_prime = copy.deepcopy(_adj)
+            _adj_prime[data.train_pos_edge_index[0, data.df_mask], data.train_pos_edge_index[1, data.df_mask]] = 0
+            _adj_prime[data.train_pos_edge_index[1, data.df_mask], data.train_pos_edge_index[0, data.df_mask]] = 0
+            _adj_prime_norm = utils.normalize(_adj_prime.to(self.device) + torch.eye(data.num_nodes, device=self.device))
+
+            z = model(data.x.to(self.device), _adj_norm)
+            z_wo_df = model(data.x.to(self.device), _adj_prime_norm)
+            # z = model(data.x.to(self.device), data.train_pos_edge_index[:, data.sdf_mask])
             # z1, z2 = model(data.x, data.train_pos_edge_index[:, data.sdf_mask], return_all_emb=True)
             # print('current deletion weight', model.deletion1.deletion_weight.sum(), model.deletion2.deletion_weight.sum())
             # print('aaaaaa', z[data.sdf_node_2hop_mask].sum())
 
             # Effectiveness and Randomness
-            if data.df_mask.sum() == 8:
-                neg_size = data.df_mask.sum() * 10
-            else:
-                neg_size = data.df_mask.sum()
+            # if data.df_mask.sum() == 8:
+            #     neg_size = data.df_mask.sum() * 10
+            # else:
+            #     neg_size = data.df_mask.sum()
+
+            neg_size = data.df_mask.sum() * 20
+            # neg_size = data.df_mask.sum()
             neg_edge_index = negative_sampling(
                 edge_index=data.train_pos_edge_index,
                 num_nodes=data.num_nodes,
@@ -1458,7 +1304,8 @@ class GNNDeleteTrainer(Trainer):
 
             df_logits = model.decode(z, data.train_pos_edge_index[:, data.df_mask], neg_edge_index)
             if neg_size != data.df_mask.sum():
-                loss_r = loss_fct(df_logits[:data.df_mask.sum()].repeat(10), df_logits[data.df_mask.sum():])
+                # print('11', df_logits[:data.df_mask.sum()].shape, df_logits.shape, data.df_mask.sum())
+                loss_r = loss_fct(df_logits[:data.df_mask.sum()].repeat(20, 1), df_logits[data.df_mask.sum():])
             else:
                 loss_r = loss_fct(df_logits[:neg_size], df_logits[neg_size:])
             # df_logits = model.decode(
@@ -1472,16 +1319,14 @@ class GNNDeleteTrainer(Trainer):
 
             # Local causality
             if sdf2_all_pair_without_df_mask.sum() != 0:
-                logits_sdf = (z @ z.t())[sdf2_all_pair_without_df_mask].sigmoid()
+                logits_sdf = (z_wo_df @ z_wo_df.t())[sdf2_all_pair_without_df_mask].sigmoid()
                 loss_l = loss_fct(logits_sdf, logits_ori[sdf2_all_pair_without_df_mask].sigmoid())
                 # print('local proba', logits_sdf.shape, logits_sdf, logits_ori[sdf2_all_pair_without_df_mask].sigmoid())
             
             else:
                 loss_l = torch.tensor(0)
-                print('local proba', 0)
 
-
-            alpha = 0.5
+            alpha = 0.2
             loss = alpha * loss_r + (1 - alpha) * loss_l
 
             # loss, loss_r, loss_l = self.compute_loss(
@@ -1503,9 +1348,20 @@ class GNNDeleteTrainer(Trainer):
                 'loss_l': loss_l.item(),
                 'train_time': epoch_time
             }
-            # wandb.log(step_log)
-            # msg = [f'{i}: {j:>4d}' if isinstance(j, int) else f'{i}: {j:.4f}' for i, j in step_log.items()]
-            # tqdm.write(' | '.join(msg))
+
+            # validation
+            # valid_loss, val_auc = self.eval(model, retrain_data, 'val', device=self.device)
+            # # print(f'Epoch: {epoch}, Train Loss: {loss.item():.4f}, Valid Loss: {valid_loss:.4f}, Valid AUC: {val_auc:.4f}')
+            # if val_auc > best_metric:
+            #     best_metric = val_auc
+            #     best_epoch = epoch
+            #     patience = 0
+
+            #     best_state_dict = model.state_dict()
+            # else:
+            #     patience += 1
+            #     if patience > 20:
+            #         break
 
             # if (epoch + 1) % self.args.valid_freq == 0:
             #     valid_loss, dt_auc, dt_aup, df_auc, df_aup, df_logit, logit_all_pair, valid_log = self.eval(model, data, 'val')
@@ -1542,6 +1398,7 @@ class GNNDeleteTrainer(Trainer):
         #     'optimizer_state': optimizer.state_dict(),
         # }
         # torch.save(ckpt, os.path.join(args.checkpoint_dir, 'model_final.pt'))
+        # model.load_state_dict(best_state_dict)
 
 
 def parse_args():
@@ -1554,7 +1411,7 @@ def parse_args():
     obj.dataset = 'citeseer'
     obj.checkpoint_dir = 'checkpoint'
     obj.valid_freq = 10
-    obj.epochs = 10
+    obj.epochs = 50
 
 
     return obj
@@ -1564,13 +1421,16 @@ class GNNDelete(Unlearn):
     def __init__(self, seed, data, features, adj, labels, config, device, model_type, epochs, verbose) -> None:
         super().__init__(seed, features, adj, labels, config, device, model_type, epochs, verbose)
 
-        self.num_epochs = 2000
+        # self.num_epochs = epochs
         self.data = data
         self.edge_index = data.edge_index.to(self.device)
 
-        self.model = GCN_delete(in_dim=self.features.shape[1],
-                                hidden_dim=self.config['nhid'],
-                                out_dim=int(self.labels.max().item() + 1)).to(self.device)
+        self.model = GCNDelete(
+            nfeat=self.features.shape[1],
+            nhid=self.config['nhid'],
+            nclass=int(self.labels.max().item() + 1),
+            droput=self.config['dropout'],
+        ).to(self.device)
         
         # self.model = GCN(nfeat=self.features.shape[1], 
         #             nhid=self.config['nhid'], 
@@ -1591,6 +1451,7 @@ class GNNDelete(Unlearn):
         _labels_val = self.labels[self.idx_val]
         
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['lr'], weight_decay=1e-5)
+        criterion = torch.nn.CrossEntropyLoss()
 
         best_valid_loss = math.inf
         trial_count = 0
@@ -1598,17 +1459,25 @@ class GNNDelete(Unlearn):
 
         for e in range(self.epochs):
             self.model.train()
-            output = F.log_softmax(self.model(self.features, self.edge_index), dim=1)
-            loss_train = F.nll_loss(output[self.idx_train], _labels_train)
-
+            optimizer.zero_grad()
+            output = self.model(self.features, self.adj_norm)[self.idx_train]
+            loss_train = criterion(output, _labels_train)
             loss_train.backward()
             optimizer.step()
-            optimizer.zero_grad()
+            # self.model.train()
+            # output = F.log_softmax(self.model(self.features, self.edge_index), dim=1)
+            # loss_train = F.nll_loss(output[self.idx_train], _labels_train)
+
+            # loss_train.backward()
+            # optimizer.step()
+            # optimizer.zero_grad()
 
             self.model.eval()
             with torch.no_grad():
-                output = F.log_softmax(self.model(self.features, self.edge_index), dim=1)[self.idx_val]
-                loss_val = F.nll_loss(output, _labels_val)
+                output = self.model(self.features, self.adj_norm)[self.idx_val]
+                loss_val = criterion(output, _labels_val)
+                # output = F.log_softmax(self.model(self.features, self.edge_index), dim=1)[self.idx_val]
+                # loss_val = F.nll_loss(output, _labels_val)
 
             if loss_val < best_valid_loss:
                 best_valid_loss = loss_val
@@ -1624,7 +1493,7 @@ class GNNDelete(Unlearn):
         self.model.load_state_dict(best_model_state)
 
         # evaluate the learned model
-        return self._evaluate(self.model, self.edge_index)
+        return self._evaluate(self.model, self.adj_norm)
     
     def posterior(self, indices=None, use_retrained=False):
         model = self.retrain_model if use_retrained else self.model
@@ -1644,31 +1513,40 @@ class GNNDelete(Unlearn):
         self.retrain_data.remove_edges(edges_to_forget)
         self.retrain_edge_index = self.retrain_data.edge_index.to(self.device)
 
+        self.adj_prime = copy.deepcopy(self.adj)
+        delete_edge_index = to_undirected(torch.tensor(edges_to_forget).t())
+        self.adj_prime[delete_edge_index[0], delete_edge_index[1]] = 0
+        self.adj_prime_norm = utils.normalize(self.adj_prime + torch.eye(self.adj_prime.shape[0]).to(self.device))
+
         # print('edges:', edges_to_forget)
         # construct the mask of edge index
-        _edge_index = utils.to_directed(self.edge_index)
-        deletion_mask = torch.zeros(_edge_index.shape[1], dtype=torch.bool)
+        # _edge_index = utils.to_directed(self.edge_index)
+        deletion_mask = torch.zeros(self.edge_index.shape[1], dtype=torch.bool)
         for u, v in edges_to_forget:
-            _match = torch.eq(_edge_index, torch.tensor([u, v], device=self.device).view(2, -1))
-            idx = _match[0] & _match[1]
-            if idx.sum() > 0:
-                deletion_mask[torch.nonzero(idx).squeeze()] = True    
-            
-            _match = torch.eq(_edge_index, torch.tensor([v, u], device=self.device).view(2, -1))
-            idx = _match[0] & _match[1]
-            if idx.sum() > 0:
-                deletion_mask[torch.nonzero(idx).squeeze()] = True    
-        
+            _match = torch.eq(self.edge_index, torch.tensor([u, v], device=self.device).view(2, -1))
+            uv_idx = _match[0] & _match[1]
+            _match = torch.eq(self.edge_index, torch.tensor([v, u], device=self.device).view(2, -1))
+            vu_idx = _match[0] & _match[1]
+            if uv_idx.sum() == 1 and vu_idx.sum() == 1:
+                deletion_mask[torch.nonzero(uv_idx).squeeze()] = True
+                deletion_mask[torch.nonzero(vu_idx).squeeze()] = True
+            else:
+                raise ValueError(f'Invalid edge index, multiple e: ({u},{v}), {uv_idx.sum()}, {vu_idx.sum()}') 
         # print('edges 2:', _edge_index[:, deletion_mask])
         _, two_hop_edge, _, two_hop_mask = k_hop_subgraph(
-            _edge_index[:, deletion_mask].flatten().unique(),
+            self.edge_index[:, deletion_mask].flatten().unique(),
             2, self.edge_index, num_nodes=self.num_nodes
+        )
+
+        _, two_hop_edge_wo_df, _, two_hop_mask_wo_df = k_hop_subgraph(
+            self.edge_index[:, deletion_mask].flatten().unique(),
+            2, self.retrain_edge_index, num_nodes=self.num_nodes
         )
         two_hop_mask = two_hop_mask.to('cpu')
         self.data.sdf_mask = two_hop_mask
 
         _, one_hop_edge, _, one_hop_mask = k_hop_subgraph(
-            _edge_index[:, deletion_mask].flatten().unique(),
+            self.edge_index[:, deletion_mask].flatten().unique(),
             1, self.edge_index, num_nodes=self.num_nodes
         )
         sdf_node_1hop = torch.zeros(self.num_nodes, dtype=torch.bool)
@@ -1679,66 +1557,91 @@ class GNNDelete(Unlearn):
         self.data.sdf_node_1hop_mask = sdf_node_1hop
         self.data.sdf_node_2hop_mask = sdf_node_2hop
 
-        train_pos_edge_index, [deletion_mask, two_hop_mask] = to_undirected(_edge_index.cpu(), [deletion_mask, two_hop_mask])
-        train_pos_edge_index = train_pos_edge_index.to(self.device)
+        # train_pos_edge_index, [deletion_mask, two_hop_mask] = to_undirected(_edge_index.cpu(), [deletion_mask, two_hop_mask])
+        train_pos_edge_index = self.edge_index
         two_hop_mask = two_hop_mask.bool().to(self.device)
-        deletion_mask = deletion_mask.bool()
+        # deletion_mask = deletion_mask.bool()
         dr_mask = ~deletion_mask
         # print('edges 3:', train_pos_edge_index[:, deletion_mask])
 
         self.data.train_pos_edge_index = train_pos_edge_index
-        self.edge_index = train_pos_edge_index
+        self.data.retrain_pos_edge_index = self.retrain_edge_index
+        self.retrain_data.train_pos_edge_index = train_pos_edge_index
+        # self.edge_index = train_pos_edge_index
         self.data.sdf_mask = two_hop_mask
         self.data.dr_mask = dr_mask
+        self.retrain_data.dr_mask = dr_mask
         self.data.df_mask = deletion_mask
-        print('1111', self.data.df_mask.sum())
+        self.data.two_hop_edge_wo_df = two_hop_edge_wo_df
+        # print('1111', self.data.df_mask.sum())
         
         # self.data.train_pos_edge_index = self.edge_index
         # self.data.sdf_mask = _two_hop_mask
 
-        self.retrain = GCNDelete(in_dim=self.features.shape[1],
-                                 hidden_dim=self.config['nhid'],
-                                 out_dim=int(self.labels.max().item() + 1),
-                                 mask_1hop=sdf_node_1hop,
-                                 mask_2hop=sdf_node_2hop) 
+        # self.retrain = GCNDelete(in_dim=self.features.shape[1],
+        #                          hidden_dim=self.config['nhid'],
+        #                          out_dim=int(self.labels.max().item() + 1),
+        #                          mask_1hop=sdf_node_1hop,
+        #                          mask_2hop=sdf_node_2hop) 
+        self.retrain = GCNDeletion(
+            nfeat=self.features.shape[1],
+            nhid=self.config['nhid'],
+            nclass=int(self.labels.max().item() + 1),
+            dropout=self.config['dropout'],
+            mask_1hop=sdf_node_1hop,
+            mask_2hop=sdf_node_2hop
+        )
         self.retrain.load_state_dict(self.model.state_dict(), strict=False)
         self.retrain = self.retrain.to(self.device)
+        self.retrain.eval()
         with torch.no_grad():
-            z = self.model(self.features, self.edge_index)
+            z = self.model(self.features, self.adj_norm)
             logits_ori = z @ z.t()
+
+        self.model.train()
+        _adj = torch.zeros_like(self.adj_prime)
+        _adj[self.edge_index[0, self.data.sdf_mask.cpu()], self.edge_index[1, self.data.sdf_mask.cpu()]] = 1
+        _adj_norm = utils.normalize(_adj.to(self.device) + torch.eye(self.num_nodes, device=self.device))
+        z = self.model(self.features, _adj_norm)
 
         parameters_to_optimize = [
             {'params': [p for n, p in self.retrain.named_parameters() if 'del' in n], 'weight_decay': 1E-5},
         ]
-        optimizer = torch.optim.Adam(parameters_to_optimize, lr=0.01, weight_decay=1E-5)
+        optimizer = torch.optim.Adam(parameters_to_optimize, lr=0.001, weight_decay=1E-5)
 
         _args = parse_args()
         trainer = GNNDeleteTrainer(_args, device=self.device)
-        trainer.train(self.retrain, self.data, optimizer, _args, logits_ori=logits_ori, attack_model_all=None, attack_model_sub=None)
+        trainer.train(self.retrain, self.data, self.retrain_data, optimizer, _args, logits_ori=logits_ori, attack_model_all=None, attack_model_sub=None)
 
         # evaluate the learned model
-        return self._evaluate(self.retrain, self.retrain_edge_index)
+        return self._evaluate(self.retrain, self.adj_prime_norm)
 
 
     def predict(self, target_nodes, use_retrained=False, return_posterior=False):
         model = self.retrain if use_retrained else self.model
         edge_index = self.retrain_edge_index if use_retrained else self.edge_index
-        # adj_norm = self.adj_prime_norm if use_retrained else self.adj_norm
+        adj_norm = self.adj_prime_norm if use_retrained else self.adj_norm
 
         model.eval()
         with torch.no_grad():
-            outputs = model(self.features, edge_index)[target_nodes]
+            outputs = model(self.features, adj_norm)[target_nodes]
         y_pred = torch.argmax(outputs, dim=1).cpu().numpy()
         if return_posterior:
             return y_pred, outputs.cpu().detach()
         else:
             return y_pred
+        
+    def parameters(self, use_retrained=False):
+        model = self.retrain if use_retrained else self.model
+        return [p for n, p in model.named_parameters() if 'gc' in n], [p for n, p in model.named_parameters() if 'del' in n]
 
-    def _evaluate(self, model, edge_index):
+    def _evaluate(self, model, adj):
         model.eval()
         with torch.no_grad():
-            outputs = model(self.features, edge_index)[self.idx_test]
+            outputs = model(self.features, adj)[self.idx_test]
+        loss = F.cross_entropy(outputs, self.labels[self.idx_test]) 
         y_preds = outputs.argmax(dim=1)
         y_true = self.labels[self.idx_test].cpu().numpy()
         result = classification_report(y_true, y_preds.cpu().numpy(), output_dict=True, zero_division=0)
+        result['loss'] = loss.cpu().item()
         return result

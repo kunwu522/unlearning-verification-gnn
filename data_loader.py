@@ -11,6 +11,8 @@ import networkx as nx
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid, Coauthor, FacebookPagePage, CitationFull, Amazon, LastFMAsia, PolBlogs
+from ogb.lsc import MAG240MDataset
+from ogb.nodeproppred import NodePropPredDataset
 from torch_geometric.utils import subgraph, to_torch_coo_tensor, to_edge_index, k_hop_subgraph, is_undirected, to_undirected, to_networkx, homophily
 from sklearn.model_selection import train_test_split
 
@@ -275,6 +277,32 @@ class GraphDataset:
         self._split_datasets()
         self.adj_list = self._generate_adj_list()
 
+    def subgraph_by_edges(self, num_edges, force_nodes=None):
+        _edges = utils.to_directed(self.edge_index).t().tolist()
+        if num_edges < len(_edges):
+            _edges = random.sample(_edges, num_edges)
+        _nodes = set([v for e in _edges for v in e])
+        if force_nodes is not None:
+            _nodes = _nodes.union(set(force_nodes))
+            # _nodes.extend(force_nodes)
+        _nodes = list(_nodes)
+
+        node2idx = {v: idx for idx, v in enumerate(_nodes)}
+
+        self.x = self.x[_nodes]
+        self.y = self.y[_nodes]
+        _edges = torch.tensor([[node2idx[e[0]], node2idx[e[1]]] for e in _edges], dtype=torch.long)
+        self.edge_index = to_undirected(_edges.t())
+        # self.edge_index = subgraph(torch.tensor(_nodes, dtype=torch.long), self.edge_index, relabel_nodes=True)[0]
+        self.edges = self.edge_index.t().tolist()
+        self.num_nodes = len(_nodes)
+        self.sample_nodes = self.num_nodes
+        self._split_datasets()
+        self.adj_list = self._generate_adj_list()
+
+        return node2idx
+
+
     def partial_graph(self, size):
         """
         Approahch 1, randomly sample nodes and edges
@@ -394,6 +422,7 @@ class GraphDataset:
         print('  # of nodes:', self.num_nodes)
         print('  # of edges:', self.edge_index.size(1))
         print('  # of features:', self.num_features)
+        print('  binary feature:', torch.unique(self.x).size(0) == 2)
         print('  # of classes:', self.num_classes)
         print('  # of train nodes:', len(nodes_train))
         print('  # of valid nodes:', len(nodes_valid))
@@ -650,8 +679,13 @@ def load(args, binary=False):
         dataset = GraphDataset(args.dataset, LastFMAsia(root='./data/lastfm'), binary=binary, sample_nodes=args.subgraph)
     elif args.dataset == 'mock':
         dataset = GraphDataset(args.dataset, mocking_graph(), mock=True)
+    elif args.dataset == 'mag':
+        dataset = GraphDataset(args.dataset, MAG240MDataset(root='./data/mag240m'))
+    elif args.dataset == 'ogbn-papers100M':
+        dataset = GraphDataset(args.dataset, NodePropPredDataset(name='ogbn-papers100M', root='./data/ogbn-papers100M'))
     else:
         raise NotImplementedError(f'Invalid dataset {args.dataset}.')
+    
     return dataset
 
 
@@ -663,12 +697,42 @@ if __name__ == '__main__':
           8,   7,   6,  13,   5,  11]
     parser = argument.load_parser()
     parser.add_argument('--node', type=int, required=False)
-    parser.add_argument('--nodes', type=int, nargs='+', required=True)
+    parser.add_argument('--nodes', type=int, nargs='+', required=False)
     args = parser.parse_args()
 
+    args.subgraph = 10000
     data = load(args)
     # data.detail_info(args.node)
-    print(data.y[args.nodes].tolist())
+    # print(data.y[args.nodes].tolist())
+    print(torch.unique(data.y, return_counts=True))
+    print('!!!', data.x.sum(dim=1).mean())
+
+    from detection import JaccardSimilarity, OutlierDetector
+    # detector = JaccardSimilarity(data, [0], [[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]], 'cpu')
+
+    # _data = Data(edge_index=data.edge_index, num_nodes=data.num_nodes)
+    # G = to_networkx(_data)
+    detector = OutlierDetector(data, [0], [[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]])
+    # detector.betweenness = nx.betweenness_centrality(G)
+    print()
+
+    u = 4875
+    # detector.detect_all()
+    print(f'finding 0 js with {u}, label {data.y[u]}')
+    labels_with_0_js = []
+    nodes_with_0_js = []
+    for v in range(data.num_nodes):
+        if v == u:
+            continue
+        _v = data.x[v].numpy()
+        _u = data.x[u].numpy()
+        J = detector._jaccard_similarity(_v, _u)
+        if J == 0:
+            # print(f'v: {v}, label {data.y[v]}')
+            labels_with_0_js.append(data.y[v])
+            nodes_with_0_js.append(v)
+    print(f'the number of nodes with 0 js: {len(nodes_with_0_js)}')
+    print(f'the label distribution:', np.unique(labels_with_0_js, return_counts=True))
     exit(0)
 
     # for v in range(data.num_nodes):

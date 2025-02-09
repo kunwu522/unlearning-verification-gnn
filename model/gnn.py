@@ -119,6 +119,8 @@ class GNN:
         if 'fix_weight' in kwargs and kwargs['fix_weight']:
             torch.manual_seed(args.seed)
             torch.cuda.manual_seed_all(args.seed)
+            # random.seed(args.seed)
+            # np.random.seed(args.seed)
             if args.target == 'gcn':
                 if 'layer3' in kwargs and kwargs['layer3']:
                     self.model = GCN3(num_features, [16, 16], num_classes, args.dropout, activation=activation, bias=bias)
@@ -132,7 +134,7 @@ class GNN:
             elif args.target == 'sage':
                 self.model = GraphSAGE(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
             elif args.target == 'gin':
-                self.model = GIN(num_features, args.hidden_size, num_classes, args.dropout, activation=activation, bias=bias)
+                self.model = GIN(num_features, 128, num_classes, args.dropout, activation=activation, bias=bias)
         else:
             if args.target == 'gcn':
                 if 'layer3' in kwargs and kwargs['layer3']:
@@ -146,7 +148,7 @@ class GNN:
             elif args.target == 'sage':
                 self.model = GraphSAGE(num_features, args.hidden_size, num_classes, args.dropout, args.alpha, args.nb_heads)
             elif args.target == 'gin':
-                self.model = GIN(num_features, args.hidden_size, num_classes, args.dropout, activation=activation, bias=bias)
+                self.model = GIN(num_features, 128, num_classes, args.dropout, activation=activation, bias=bias)
             # self.model = GCN(num_features, args.hidden_size, num_classes, activation=activation)
 
     def insufficient_train(self, data, device):
@@ -443,6 +445,7 @@ class GNN:
 
         y_preds, y_true = [], []
         self.model.eval()
+        losses = []
         with torch.no_grad():
             for nodes, labels in test_loader:
                 nodes = nodes.to(device)
@@ -451,6 +454,8 @@ class GNN:
                     outputs = self.model(x, edge_index)
                 else:
                     outputs = self.model(x, adj)
+                loss = F.cross_entropy(outputs[nodes], labels)
+                losses.append(loss.cpu().item())
                 # outputs = self.model(x, edge_index)
                 y_pred = torch.argmax(outputs[nodes], dim=1)
                 y_preds.extend(y_pred.cpu().tolist())
@@ -468,6 +473,7 @@ class GNN:
             'precision': precision,
             'recall': recall,
             'f1': f1,
+            'loss': np.mean(losses),
         }
         # return {
         #     'accuracy': results['accuracy'],
