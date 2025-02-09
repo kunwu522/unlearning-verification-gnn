@@ -31,7 +31,7 @@ python experiment.py --task efficiency -g 0 --dataset citeseer --num-trials 1
 ### Factor Analysis
 #### Figure 3
 
-* Impact of $$\alpha$$ and $$\beta$$ ((a) and (b)).
+* Impact of $\alpha$ and $\beta$ ((a) and (b)).
 ```
 python experiment.py --task empirical -g 0 --dataset citeseer
 ```
