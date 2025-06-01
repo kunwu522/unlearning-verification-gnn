@@ -11,9 +11,8 @@ import json
 import random
 import pickle
 import logging
+from collections import defaultdict
 from itertools import combinations
-from ast import literal_eval
-from collections import defaultdict, namedtuple
 import multiprocessing
 from multiprocessing import Pool
 from functools import partial
@@ -22,9 +21,7 @@ import numpy as np
 import scipy.sparse as sp
 import pandas as pd
 import torch
-import torch.nn.functional as F
-import torch.multiprocessing as mp
-from torch_geometric.utils import to_undirected, sort_edge_index, k_hop_subgraph, is_undirected, negative_sampling
+from torch_geometric.utils import to_undirected, k_hop_subgraph, negative_sampling
 from torch_geometric.data import Data
 from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPClassifier
@@ -41,13 +38,9 @@ import data_loader
 from model.gnn import GNN
 from nettack_adapter import adapte as ntk
 from gf_attack_adapter import adapte as gfa
-from robust_gcn_structure.certify import is_1perturbation_fragile_node
-from gta import generate_topo_input, generate_masks, backdoor_attack
-from gua import iterative_minimum_perturbation, minimum_attack, _iterative_minimum_perturbation
-from mibtack.attack import MiBTack
-from verify_attack import Minimum_MinMax_Attack
-from verify_attack_new import OneShotAttack
-from certified_gnn import find_non_robust_nodes
+# from gta import generate_topo_input, generate_masks, backdoor_attack
+# from gua import iterative_minimum_perturbation, minimum_attack, _iterative_minimum_perturbation
+# from certified_gnn import find_non_robust_nodes
 from certified_fragile_nodes import CertifiedFragilenessLazy
 import unlearn
 from detection import LinkPredDetector, OutlierDetector, ProximityDetector, GraphGenDetect, JaccardSimilarity
@@ -125,43 +118,6 @@ def _get_perturbations_filename(args, name, method, t):
 
 def _escape_probability(K, K_t, q):
     return math.comb(K_t, K) * (q ** K) * ((1 - q) ** (K_t - K))
-
-def _call_certify(pair, surrogate, data):
-     v, y_v = pair
-     return is_1perturbation_fragile_node(surrogate, data, v, y_v)
-
-def find_non_robust_nodes_margin(surrogate, data, candidates, predictions, device):
-    """ Find the nodes that are not robust to perturbation of size 1
-    """
-    pool = Pool(processes=10)
-    res = list(tqdm(
-            pool.imap_unordered(
-            partial(_call_certify, surrogate=surrogate, data=data), 
-            zip(candidates, predictions)
-        ), total=len(candidates), desc='certifing'))
-    # one_pert_fragile_nodes = defaultdict(list)
-    non_robust_nodes = []
-    for v, r in zip(candidates, res):
-        if r:
-            non_robust_nodes.append(v)
-            # one_pert_fragile_nodes[v].append(r)
-        # for c, certified in r.items():
-        #     if certified:
-        #         one_pert_fragile_nodes[v].append(c)
-    return non_robust_nodes
-
-    # with tqdm(total=len(candidates), desc='certifing') as pbar:
-    #     for v, y_v in zip(candidates, predictions):
-    #         res = is_1perturbation_fragile_node(surrogate, data, v, y_v)
-    #         for c, certified in res.items():
-    #             if certified:
-    #                 one_pert_fragile_nodes[v].append(c)
-    #         # if len(one_pert_fragile_nodes) >= 2:
-    #         #     break
-
-    #         pbar.update(1)
-            
-    # return one_pert_fragile_nodes
 
 
 def sample_node_tokens(args, data, candidate_nodes, 
@@ -332,16 +288,6 @@ def sample_edge_tokens(args, data, target_node, surrogate_model=None, prediction
         nettack.attack_surrogate(n_perturbations, perturb_structure=True, perturb_features=False, direct=True, n_influencers=1)
         E_t = nettack.structure_perturbations
         # _edge_index = to_undirected(torch.tensor(nettack.structure_perturbations).t())
-    elif args.edge_sampler == 'gua':
-        device = utils.get_device(args)
-        # n_perturbations = int(data.degree(target_node)) if data.degree(target_node) > 1 else 2
-        n_perturbations = 1
-        # if data.degree(target_node) <= 1:
-        #     n_perturbations = 2
-        # else:
-        #     n_perturbations = min(data.degree(target_node), 10)
-        # E_t = _iterative_minimum_perturbation(surrogate_model, data, target_node, prediction[0], device, n_perturbation=n_perturbations)
-        E_t = iterative_minimum_perturbation(surrogate_model, data, target_node, prediction[0], device, n_perturbation=n_perturbations)
     elif args.edge_sampler == 'gf':
         device = utils.get_device(args)
         # n_perturbations = int(data.degree(target_node)) if data.degree(target_node) > 1 else 2
@@ -352,15 +298,6 @@ def sample_edge_tokens(args, data, target_node, surrogate_model=None, prediction
         #     n_perturbations = min(data.degree(target_node), 10)
         gf_attack = gfa(data, target_node, n_perturbations, device)
         E_t = gf_attack.structure_perturbations
-    elif args.edge_sampler == 'mibtack':
-        device = utils.get_device(args)
-        # E_t = mibtack(args, surrogate_model, data, target_node, prediction, device)
-        mibtack = MiBTack(
-            surrogate_model.model, data, device, 
-            target=args.target, dataset=args.dataset, verbose=False,
-            explore=False
-        )
-        E_t = mibtack.attack(target_node, label, prediction)
     elif args.edge_sampler == 'ig':
         device = utils.get_device(args)
         # contruct features sparse
@@ -380,77 +317,6 @@ def sample_edge_tokens(args, data, target_node, surrogate_model=None, prediction
         perturbed_edges = np.array(np.where(attacker.modified_adj != adj.toarray()))
         perturbed_edges = perturbed_edges[:, perturbed_edges[0] < perturbed_edges[1]]
         E_t = list(map(tuple, perturbed_edges.T.tolist()))
-    elif args.edge_sampler == 'pgd':
-        device = utils.get_device(args)
-        surrogate = GCN(nfeat=data.num_features, nclass=data.num_classes, nhid=16, with_relu=True, with_bias=False, device=device).to(device)
-        # contruct adjacency matrix
-        row = data.edge_index.numpy()[0]
-        col = data.edge_index.numpy()[1]
-        value = np.ones((len(row)))
-        adj = torch.sparse_coo_tensor(
-            (row, col), value, size=(data.num_nodes, data.num_nodes), dtype=torch.int
-        ).to_dense().numpy()
-        surrogate.fit(data.x, adj, data.y, data.train_set.nodes.tolist(), data.valid_set.nodes.tolist())
-        # contruct features sparse
-        # row, col = np.where(data.x.numpy() == 1)
-        # value = np.ones((len(row)))
-        # x = sp.csr_matrix((value, (row, col)), shape=data.x.shape)
-        # labels = data.y.numpy()
-
-        attacker = PGDAttack(surrogate, data.num_nodes, loss_type='CE', device=device).to(device)
-        # n_perturbations = data.degree(target_node) if data.degree(target_node) > 1 else 2
-        n_perturbations = args.num_perts
-        attacker.attack(data.x.numpy(), adj, data.y.numpy(), data.train_set.nodes.tolist(), target_node, n_perturbations=n_perturbations)
-        modified_adj = attacker.modified_adj.cpu().numpy()
-        perturbed_edges = np.array(np.where(modified_adj != adj))
-        perturbed_edges = perturbed_edges[:, perturbed_edges[0] < perturbed_edges[1]]
-        # print(perturbed_edges)
-        E_t = list(map(tuple, perturbed_edges.T.tolist()))
-
-    elif args.edge_sampler == 'minmax':
-        device = utils.get_device(args)
-        surrogate = GCN(nfeat=data.num_features, nclass=data.num_classes, nhid=16, with_relu=True, with_bias=False, device=device).to(device)
-        adj = data.adjacency_matrix().to_dense().numpy()
-        surrogate.fit(data.x, adj, data.y, data.train_set.nodes.tolist(), data.valid_set.nodes.tolist())
-
-        attacker = MinMax(surrogate, data.num_nodes, loss_type='CW', device=device).to(device)
-        # n_perturbations = data.degree(target_node) if data.degree(target_node) > 1 else 2
-        n_perturbations = args.num_perts
-        # if data.degree(target_node) <= 1:
-        #     n_perturbations = 2
-        # else:
-        #     n_perturbations = min(data.degree(target_node), 10)
-        idx_nodes = data.train_set.nodes.to(device)
-        attacker.attack(data.x.numpy(), adj, data.y.numpy(), idx_nodes, target_node, n_perturbations=n_perturbations+2)
-        modified_adj = attacker.modified_adj.cpu().numpy()
-        perturbed_edges = np.array(np.where(modified_adj != adj))
-        perturbed_edges = perturbed_edges[:, perturbed_edges[0] < perturbed_edges[1]]
-        E_t = list(map(tuple, perturbed_edges.T.tolist()))[:n_perturbations]
-
-    elif args.edge_sampler == 'independent':
-        # n_perturbations = int(data.degree(target_node)) if data.degree(target_node) > 1 else 2
-        n_perturbations = random.randint(data.degree(target_node), data.degree(target_node) * 2)
-        # find uninfected nodes and randomly generate edges
-        k_hop_nodes, _, _, _ = k_hop_subgraph(target_node, 2, edge_index=data.edge_index)
-        nodes = torch.arange(data.num_nodes)
-        uninfected_nodes = nodes[~torch.isin(nodes, k_hop_nodes)]
-        uninfected_edges, adv_nodes = [], []
-        while len(uninfected_edges) < n_perturbations:
-            u, v = random.sample(uninfected_nodes.tolist(), 2)
-            comp = torch.isin(data.edge_index, torch.tensor([u, v]))
-            if torch.sum(comp[0] & comp[1]) == 0:
-                uninfected_edges.append([u, v])
-                adv_nodes.extend([u, v]) 
-        E_t = uninfected_edges
-        # _edge_index = to_undirected(torch.tensor(uninfected_edges).t())
-    elif args.edge_sampler == 'ours':
-        attacker = OneShotAttack(surrogate_model, data)
-        adj = data.adjacency_matrix()
-        E_t = attacker.attack(data.x, adj, torch.tensor([prediction]), target_node)
-
-        # attacker = Minimum_MinMax_Attack(surrogate_model, data)
-        # adj = data.adjacency_matrix()
-        # E_t = attacker.attack(data.x, adj, torch.tensor([prediction]), target_node)
     return E_t
 
 def check_incompleteness_unlearn(args, target_node, adv_pred, adv_data, triggers, device, unlearn_method, unlearn_model):
@@ -913,292 +779,6 @@ def _verify_fragileness_mp(args, model, data, target_node, prediction, second_la
             }
     return certified
 
-def verify_1perturbation_fragile_nodes(args):
-    device = utils.get_device(args)
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        random.seed(args.seed)
-        if_fix_seed = True
-    else:
-        is_fix_seed = False
-    
-    result = defaultdict(list)
-    for t in range(args.num_trials):
-        if not is_fix_seed:
-            args.seed = random.randint(-1e+5, 1e+5)
-        data = data_loader.load(args)
-
-        target_model = _get_target_model(args, data, device)
-        target_train_preds = target_model.predict(data, device, target_nodes=data.train_set.nodes.tolist())
-        target_test_preds = target_model.predict(data, device, target_nodes=data.test_set.nodes.tolist())
-        res_target = target_model.evaluate(data, device)
-        print('The results of target model:', res_target)
-
-        # surrogate_data = copy.deepcopy(data)
-        # surrogate_data.train_set.y = target_train_preds 
-        # surrogate = GNN(args, surrogate_data.num_features, surrogate_data.num_classes, bias=args.edge_sampler != 'nettack', fix_weight=not args.cpf_random)
-        # surrogate.train(surrogate_data, device)
-
-        if args.node_sampler == 'margin':
-            candidates = find_non_robust_nodes_margin(target_model.model, data, data.test_set.nodes.tolist(), target_test_preds, device)
-        elif args.node_sampler == 'smooth':
-            candidates = find_non_robust_nodes(args, target_model, data, data.test_set.nodes.tolist())
-        elif args.node_sampler == 'boundary':
-            candidates = sample_node_tokens(args, data, data.test_set.nodes.tolist(), target_model, amplify=1)
-        elif args.node_sampler == 'high_degree':
-            node2degree = {v: data.degree(v) for v in data.test_set.nodes.tolist()}
-            sorted_node2degree = {k: v for k,v in sorted(node2degree.items(), key=lambda item: item[1], reverse=True)}
-            candidates = list(sorted_node2degree.keys())[:args.num_target_nodes]
-        elif args.node_sampler == 'all':
-            if args.num_target_nodes == -1:
-                candidates = data.test_set.nodes.tolist()
-            else:
-                candidates = random.sample(data.test_set.nodes.tolist(), args.num_target_nodes)
-        else:
-            raise ValueError('Invalid node sampler:', args.node_sampler)
-        
-        print(f'{args.node_sampler} sampler found {len(candidates)} candidates.')
-
-        target_preds, posteriors = target_model.predict(data, device, target_nodes=candidates, return_posterior=True)
-        second_best_labels = _second_best_labels(posteriors)
-        verifier = CertifiedFragileness(args, target_model, data, device, verbose=False)
-
-        # for i in range(len(candidates)):
-        #     _verify_fragileness((candidates[i], target_preds.tolist()[i], posteriors[i]), args, target_model, verifier, data, device)
-        certified_fragile_num = 0
-        fargile_but_failed_num = 0
-        pool = Pool(processes=5)
-        nodes_fragileness_result = list(tqdm(
-            pool.imap_unordered(
-                partial(_verify_fragileness, args=args, model=target_model, verifier=verifier, data=data, device=device),
-                zip(candidates, target_preds.tolist(), posteriors)
-            ),
-            total=len(candidates), desc=f'At trial {t}, certifing'
-        ))
-        pool.close()
-
-        pert_results = []
-        for res in nodes_fragileness_result:
-            """ {
-                'target_node': xx,
-                'prediction': xx,
-                'second_best_label: xx,
-                'bundary_score': xx,
-                'certified': {
-                    'x': {
-                        'target_label': x,
-                        'perturbations': [(u1, v1), (u2, v2), ...]
-                        'adj_diff.': [xx, xx, ...]
-                        'fragile': True, 
-                        'fragile_score': 0.1,
-                        'single_predictions': [],
-                        'union_predictions': []
-                    }, ...
-                }
-            }
-            """
-
-            failed_count = 0
-            for i in range(args.num_perts):
-                if 'first_one_verified' in res['certified'][res['second_best_label']][i]:
-                    if res['certified'][res['second_best_label']][i]['fragile']:
-                        certified_fragile_num += 1
-                    if res['certified'][res['second_best_label']][i]['fragile'] and not res['certified'][res['second_best_label']][i]['first_one_verified']:
-                        # print('!!!!!!!!!!', res['target_node'], 'failed to verify', res['second_best_label'])
-                        failed_count += 1 
-                    # pert_results.append(res['certified'][res['second_best_label']][i]['first_one_verified']) 
-                    # if res['certified'][res['second_best_label']][i]['fragile']:
-                    #     certified_fragile_num += 1
-            if failed_count > 0:
-                print('Failed:', res['target_node'], 'failed to verify', res['second_best_label'], 'for', failed_count, 'times')
-                print()
-                fargile_but_failed_num += 1
-
-            # if 'first_one_verified' in res['certified'][res['second_best_label']]:
-            #     if not res['certified'][res['second_best_label']]['first_one_verified']:
-            #         print('!!!!!!!!!!', res['target_node'], 'failed to verify', res['second_best_label'])
-
-            #     pert_results.append(res['certified'][res['second_best_label']]['first_one_verified']) 
-            #     if res['certified'][res['second_best_label']]['fragile']:
-            #         certified_fragile_num += 1
-                # if not res['certified'][res['second_best_label']]['first_one_verified']:
-                #     print(res)
-                #     print()
-                #     exit(0)
-
-            # if res['second_best_label'] in res['certified']:
-            #     del res['certified'][res['second_best_label']]['adj']
-            #     del res['certified'][res['second_best_label']]['adj_pert']
-            result[t].append(res)
-
-        # print('  ==> the number of certified fragile nodes:', certified_fragile_num)
-        print('Trial', t)
-        print('  ==> the number of certified fragile nodes:', certified_fragile_num)
-        print('  ==> Among those nodes, the number of nodes that 1-pert failed:', fargile_but_failed_num)
-        print()
-
-    result_file = _result_filename(args, 'fragile')
-    try:
-        with open(result_file, 'w') as fp:
-            json.dump(dict(result), fp, indent=4)
-    except TypeError as err:
-        print('result', result)
-        raise err
-
-    print('-' * 80)
-    print('  ', 'Experiment results are saved to', result_file)
-    print('-' * 80)
-
-        # iter = tqdm(one_pert_fragile_nodes.items() if isinstance(one_pert_fragile_nodes, dict) else one_pert_fragile_nodes, desc='verify')
-        # for item in iter:
-        #     # if isinstance(item, tuple):
-        #     #     v, fragile_classes = item
-        #     #     fragile_class = fragile_classes[0]
-        #     # else:
-        #     #     v = item
-        #     #     fragile_class = None
-
-        #     v, label2perturbations = item
-        #     clean_pred = target_model.predict(data, device, target_nodes=[v])
-        #     print('Attacking node', v, ', prediction:', clean_pred[0])
-        #     for target_label, perturbations in label2perturbations.items():
-        #         perturbation2pred = {}
-        #         verification_edges = []
-        #         for e in random.sample(perturbations, 10) if len(perturbations) > 10 else perturbations:
-        #             if isinstance(e, list) or isinstance(e, np.ndarray):
-        #                 e = tuple(e)
-
-        #             adv_data = copy.deepcopy(data)
-        #             adv_data.add_edges(torch.tensor([[e[0], e[1]], [e[1], e[0]]]))
-
-        #             adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-        #             adv.train(adv_data, device)
-
-        #             adv_pred = adv.predict(adv_data, device, target_nodes=[v])
-        #             perturbation2pred[e] = adv_pred[0]
-        #             if adv_pred[0] == target_label:
-        #                 verification_edges.append(e)
-            
-        #         # apply all the pontential perturbations at once
-        #         adv_data = copy.deepcopy(data)
-        #         adv_data.add_edges(to_undirected(torch.tensor(perturbations).t()))
-        #         adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-        #         adv.train(adv_data, device)
-
-        #         adv_pred = adv.predict(adv_data, device, target_nodes=[v])
-        #         print(f'  ==> fragile on label {target_label}, potential perturbations are {perturbations}, single pert predictions: {perturbation2pred}, union prediction: {adv_pred}')
-        #         print()
-
-            # for edge_sampler in ['nettack', 'ours', 'mibtack']:
-            # for edge_sampler in ['nettack']:
-            #     args.edge_sampler = edge_sampler
-            #     perturbations = sample_edge_tokens(args, data, v, surrogate, clean_pred[0], data.y[v], target_label=fragile_class)
-            #     print('perturbations', perturbations)
-
-            #     if perturbations is None or len(perturbations) == 0:
-            #         result['trial'].append(t)
-            #         result['target'].append(v)
-            #         result['label'].append(data.y[v])
-            #         result['clean prediction'].append(clean_pred[0])
-            #         result['target class'].append(fragile_class)
-            #         result['method'].append(edge_sampler)
-            #         result['perturbations'].append([])
-            #         result['single adv predictions'].append([])
-            #         result['adv prediction'].append(-1)
-            #         result['sub adv prediction'].append(-2)
-            #         result['fragileness'].append(0)
-            #         result['consistency'].append(-1)
-            #         result['incomplete'].append(-1)
-            #         continue
-
-                # consistency check
-                # perturbation2pred = {}
-                # verification_edges = []
-                # for e in random.sample(perturbations, 10) if len(perturbations) > 10 else perturbations:
-                #     adv_data = copy.deepcopy(data)
-                #     adv_data.add_edges(torch.tensor([[e[0], e[1]], [e[1], e[0]]]))
-
-                #     adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-                #     adv.train(adv_data, device)
-
-                #     adv_pred = adv.predict(adv_data, device, target_nodes=[v])
-                #     perturbation2pred[e] = adv_pred[0]
-                #     if adv_pred[0] == fragile_class:
-                #         verification_edges.append(e)
-                
-                # result['trial'].append(t)
-                # result['target'].append(v)
-                # result['label'].append(data.y[v].item())
-                # result['clean prediction'].append(clean_pred[0])
-                # result['target class'].append(fragile_class)
-                # result['method'].append(edge_sampler)
-                # result['perturbations'].append(perturbations)
-                # result['single adv predictions'].append(list(perturbation2pred.values()))
-                # result['fragileness'].append(1 if len(verification_edges) > 0 else 0)
-                # result['consistency'].append(1 if np.sum(np.array(list(perturbation2pred.values())) != fragile_class) == 0 else 0)
-
-                # verification
-                # if len(verification_edges) > 1:
-                #     adv_data = copy.deepcopy(data)
-                #     edge_index_t = to_undirected(torch.tensor(verification_edges).t()) 
-                #     adv_data.add_edges(edge_index_t)
-                #     adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-                #     adv.train(adv_data, device)
-                #     adv_pred = adv.predict(adv_data, device, target_nodes=[v])
-                #     result['adv prediction'].append(adv_pred[0])
-
-                #     if check_incompleteness(args, v, clean_pred[0], adv_pred[0], adv_data, verification_edges, device):
-                #         # print('Yes, it is incompleteness!')
-                #         result['sub adv prediction'].append(clean_pred[0])
-                #         result['incomplete'].append(1)
-                #     else:
-                #         # print('No, not incompleteness!')
-                #         result['sub adv prediction'].append(adv_pred[0])
-                #         result['incomplete'].append(0)
-                # else:
-                #     result['adv prediction'].append(-1)
-                #     result['sub adv prediction'].append(-2)
-                #     result['incomplete'].append(-1)
-
-                # if len(verification_edges) > 1:
-                #     adv_data = copy.deepcopy(data)
-                #     edge_index_t = to_undirected(torch.tensor(perturbations).t()) 
-                #     adv_data.add_edges(edge_index_t)
-                #     adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-                #     adv.train(adv_data, device)
-                #     adv_pred = adv.predict(adv_data, device, target_nodes=[v])
-                #     result['union adv prediction'].append(adv_pred[0])
-                # else:
-                #     result['union adv prediction'].append(-1)
-    
-    # df = pd.DataFrame(result)
-
-    # for edge_sampler in ['nettack', 'ours', 'mibtack']:
-    # for edge_sampler in ['nettack']:
-    #     _df = df[df['method'] == edge_sampler]
-    #     num_fraigle = 0
-    #     num_inconsistent = 0
-    #     for idx, row in _df.iterrows():
-    #         # single_adv_predictions = literal_eval(row['single adv predictions'])
-    #         single_adv_predictions = row['single adv predictions']
-    #         clean_pred = row['clean prediction']
-    #         target_class = row['target class']
-    #         if (np.array(single_adv_predictions) != target_class).sum() > 0:
-    #             num_inconsistent += 1
-    #         for single_pred in single_adv_predictions:
-    #             if single_pred != clean_pred:
-    #                 num_fraigle += 1
-    #                 break
-    #     print(f'The certified fragile nodes are {num_fraigle} out of {len(_df)} nodes.')
-    #     print(f'The inconsistent nodes are {num_inconsistent} out of {len(_df)} nodes.')
-
-    #     args.edge_sampler = edge_sampler
-    #     result_filename = _result_filename(args, 'fragile')
-    #     _df.to_csv(os.path.join('result', result_filename))
-    #     print('Verifing the fragility is Done, the result file is saved to', result_filename)
-
-
 def _verify_1perturbation_fragile(data, v, prediction, perturbations, device):
     verification_edges = []
     verification_preds = []
@@ -1217,27 +797,7 @@ def _verify_1perturbation_fragile(data, v, prediction, perturbations, device):
     # print('verification_edges', verification_edges)
     # print('verification_preds', verification_preds)
     return verification_edges, verification_preds
-
-def _certify_fragile_mp(inputs, args, data, verifier, target_node, prediction, attack_label):
-    idx, candidates = inputs
-    # candidates = data.train_set.nodes[data.train_set.y == attack_label].tolist()
-    # candidates = list(set(candidates) - set(data.adj_list[target_node]))
-    # if len(candidates) > args.candidate_size:
-    #     candidates = random.sample(candidates, args.candidate_size)
-    t0 = time.time()
-    res = verifier.certify(target_node, prediction, attack_label, candidates=candidates, solver=args.solver)
-    if (time.time() - t0) > 100:
-        print('  ==> certifing', target_node, f', done, in {(time.time() - t0):.2f}s')
-        print('step:', res['step'])
-        print('built_time:', res['buit_time'])
-    if args.verbose:
-        print('  ==> certifing', target_node, f', done, in {(time.time() - t0):.2f}s')
-    if res['fragile']:
-        p = tuple(res['perturbations'][0])
-        return p
-    else:
-        return None
-    
+ 
 
 def certify_fragile_with_perturbations(inputs, args, verifier, data):
     target_node, prediction, attack_label = inputs
@@ -1315,155 +875,8 @@ def certify_fragile_with_perturbations(inputs, args, verifier, data):
     if len(ps) != args.num_perts:
         return target_node, None, None
     else:
-        return target_node, ps, attack_label
+        return target_node, ps, attack_label 
 
-def verify_unlearning_backdoor(args):
-    device = utils.get_device(args)
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        random.seed(args.seed)
-        is_fixed_seed = True
-    else:
-        is_fixed_seed = False
-
-    result = defaultdict(list)
-    for t in range(args.num_trials):
-        if not is_fixed_seed:
-            args.seed = random.randint(0, 1e+5)
-            torch.manual_seed(args.seed)
-            torch.cuda.manual_seed_all(args.seed)
-            np.random.seed(args.seed)
-            random.seed(args.seed)
-
-        data = data_loader.load(args)
-
-        target_model = _get_target_model(args, data, device)
-        target_train_preds = target_model.predict(data, device, target_nodes=data.train_set.nodes.tolist())
-
-        surrogate_data = copy.deepcopy(data)
-        surrogate_data.train_set.y = target_train_preds
-        surrogate = GNN(args, surrogate_data.num_features, surrogate_data.num_classes, surrogate=False)
-        surrogate.train(surrogate_data, device)
-
-        if args.node_sampler == 'boundary':
-            candidates = sample_node_tokens(args, data, data.test_set.nodes.tolist(), target_model, amplify=1)
-        elif args.node_sampler == 'random':
-            candidates = random.sample(data.test_set.nodes.tolist(), args.num_target_nodes)
-        target_preds, posteriors = target_model.predict(data, device, target_nodes=candidates, return_posterior=True)
-        # attack_labels = _second_best_labels(posteriors)
-
-        """ Add hyper-parameters of GTA, details can be found in gta.py
-        """
-        _args = copy.deepcopy(args)
-        _args.trigger_size = 3
-        _args.num_triggers = 10
-        _args.bilevel_steps = 4
-        _args.gtn_lr = 0.01
-        _args.topo_thrd = 0.5
-        _args.gtn_epochs = 10
-        _args.topo_activation = 'sigmoid'
-        _args.gta_batch_size = 16
-        _args.lr_decay_steps = [25, 35]
-        _args.train_epochs = 40
-        _args.lambd = 1
-        _args.gtn_input_type = '2hop'
-        _args.feat_perb = False
-
-        # Call GTA and get backdoored model, topo generator, and backdoored edges
-        bkd_model, topo_net, bkd_edges, bkd_label = backdoor_attack(_args, surrogate, data)
-        bkd_data = copy.deepcopy(data)
-        bkd_data.add_edges(to_undirected(torch.tensor(bkd_edges).t()))
-        bkd_adj = bkd_data.adjacency_matrix().to_dense().to(device)
-
-        subset_retrain_mdoel = {}
-        for v, pred in tqdm(zip(candidates, target_preds), total=len(candidates), desc='verify'):
-            result['trial'].append(t)
-            result['target node'].append(v)
-            result['ground truth'].append(data.y[v].item())
-            result['prediction'].append(pred)
-            result['attack_label'].append(bkd_label)
-
-            subset, edge_index, _, _ = k_hop_subgraph(v, 2, bkd_data.edge_index)
-            # print('subset:', subset)
-            subgraph = random.sample(subset.tolist(), min(len(subset), _args.trigger_size))
-
-            # obtain trigger of the target node
-            topo_input, feat_input = generate_topo_input(_args, bkd_data, device)
-            topo_mask, _ = generate_masks(bkd_data, [(subgraph, None)], device)
-            rst_bkd_adj = topo_net(topo_input, topo_mask, _args.topo_thrd, device, _args.topo_activation, 'topo')
-            trigger_edges = torch.nonzero(rst_bkd_adj * (1 - bkd_adj)).tolist()
-            if len(trigger_edges) == 0:
-                result['incomplete prediction'].append(-1)
-                result['incomplete'].append(0)
-                result['failed perturbation'].append([])
-                result['bkd prediction'].append(-1)
-                continue
-
-            _trigger_data = copy.deepcopy(bkd_data)
-            _trigger_data.add_edges(to_undirected(torch.tensor(trigger_edges).t()))
-
-            bkd_pred = bkd_model.predict(_trigger_data, device, target_nodes=[v])
-            result['bkd prediction'].append(bkd_pred[0])
-
-            equal_to_bkd_label = True
-            for length in range(len(bkd_edges) - 1, 0, -1):
-                for _edges in combinations(bkd_edges, length):
-                    sub_bkd_data = copy.deepcopy(bkd_data)
-                    sub_bkd_data.remove_edges(_edges)
-
-                    # print('_edges:', _edges)
-                    _edges_key = tuple(map(tuple, _edges))
-                    if _edges_key in subset_retrain_mdoel:
-                        sub_bkd_model = subset_retrain_mdoel[_edges_key]
-                    else:
-                        sub_bkd_model = GNN(args, sub_bkd_data.num_features, sub_bkd_data.num_classes, surrogate=False)
-                        sub_bkd_model.train(sub_bkd_data, device)
-                        subset_retrain_mdoel[_edges_key] = sub_bkd_model
-                    
-                    sub_bkd_pred = sub_bkd_model.predict(sub_bkd_data, device, target_nodes=[v])
-                    if sub_bkd_pred[0] != bkd_label:
-                        equal_to_bkd_label = False
-                        break
-                if not equal_to_bkd_label:
-                    break
-            if not equal_to_bkd_label:
-                result['incomplete prediction'].append(sub_bkd_pred[0].item())
-                result['incomplete'].append(1)
-                result['failed perturbation'].append(_edges)
-            else:
-                result['incomplete prediction'].append(-1)
-                result['incomplete'].append(0)
-                result['failed perturbation'].append([])
-
-        _df = pd.DataFrame(result)
-        trial_df = _df[_df['trial'] == t]
-        fpr = utils.calc_fpr(trial_df, len(trial_df))
-        fnr = utils.calc_fnr(trial_df, len(trial_df))
-        print(f' At trial {t}, the result of {args.edge_sampler}', '-' * 80)
-        print('  => FPR:', fpr)
-        print('  => FNR:', fnr)
-        print('=' * 100)
-
-    try:    
-        df = pd.DataFrame(result)
-    except ValueError as err:
-        print('result', result)
-        raise err
-
-    for t in range(args.num_trials):
-        _df = df[df['trial'] == t]
-        print(f'Trial {t}, the number of incompleteness:', _df['incomplete'].values.sum())
-        # print(f'Trial {t}, the number of fragile:', _df['fragileness'].values.sum())
-    # incompleteness = df['incomplete'].values.sum()
-    # print('  ==> The incompleteness:', incompleteness)
-
-    result_filename = _baseline_result_filename(args, 'verify')
-    df.to_csv(os.path.join('result', result_filename))
-    print('-' * 80)
-    print('Verifing unlearning is done, the result file is saved to', result_filename)
-    print('-' * 80)
-    
 
 def verify_unlearning_baselines(args):
     device = utils.get_device(args)
@@ -1489,30 +902,6 @@ def verify_unlearning_baselines(args):
 
         target_model = _get_target_model(args, data, device)
         target_train_preds = target_model.predict(data, device, target_nodes=data.train_set.nodes.tolist())
-        # target_test_preds, target_test_posts = target_model.predict(data, device, target_nodes=data.test_set.nodes.tolist(), return_posterior=True)
-        
-        # surrogate_data = copy.deepcopy(data)
-        # surrogate_data.train_set.y = target_train_preds
-        # if args.edge_sampler == 'nettack':
-        #     surrogate = GNN(args, surrogate_data.num_features, surrogate_data.num_classes, surrogate=True, bias=False)
-        #     surrogate.train(surrogate_data, device)
-        # else:
-        #     # surrogate = GNN(args, surrogate_data.num_features, surrogate_data.num_classes, surrogate=True)
-        #     surrogate = GCN(nfeat=data.num_features, nclass=data.num_classes, nhid=16, with_relu=True, with_bias=False, device=device).to(device)
-        #     # contruct adjacency matrix
-        #     row = data.edge_index.numpy()[0]
-        #     col = data.edge_index.numpy()[1]
-        #     value = np.ones((len(row)))
-        #     adj = sp.csr_matrix((value, (row, col)), shape=(data.num_nodes, data.num_nodes))
-        #     surrogate.fit(data.x, adj, data.y, data.train_set.nodes.tolist(), data.valid_set.nodes.tolist())
-        # surr_test_preds = surrogate.predict(surrogate_data, device, target_nodes=data.test_set.nodes.tolist())
-
-        # if args.node_sampler == 'boundary':
-        #     candidates = sample_node_tokens(args, data, data.test_set.nodes.tolist(), target_model, amplify=1)
-        # elif args.node_sampler == 'random':
-        #     candidates = random.sample(data.test_set.nodes.tolist(), args.num_target_nodes)
-        # target_preds, posteriors = target_model.predict(data, device, target_nodes=candidates, return_posterior=True)
-        # attack_labels = _second_best_labels(posteriors)
         surrogate_data = copy.deepcopy(data)
         surrogate_data.train_set.y = torch.from_numpy(target_train_preds)
         surrogate_data.y[surrogate_data.train_set.nodes] = torch.from_numpy(target_train_preds)
@@ -1578,40 +967,7 @@ def verify_unlearning_baselines(args):
                     num_correctness += 1
                 if not check_incompleteness(args, v, pred, adv_pred[0], adv_data, perturbations, device):
                     num_completeness += 1
-                # num_incompleteness += check_incompleteness(args, v, pred, adv_pred[0], adv_data, perturbations, device)
-
-                # if pred == adv_pred[0]:
-                #     print('Attack failed:', v, 'prediction:', pred, 'adv prediction:', adv_pred[0])
-                # result['adv prediction'].append(adv_pred[0])
-
-                # if len(perturbations)  == 1:
-                #     result['incomplete prediction'].append(-1)
-                #     result['incomplete'].append(0)
-                #     result['failed perturbation'].append([])
-                #     # result['single adv predictions'].append([])
-                #     continue
-                
-                # is_incomplete, _failed_pert = check_incompleteness(args, v, pred, adv_pred[0], adv_data, perturbations, device)
-                # if is_incomplete:
-                #     result['incomplete prediction'].append(pred)
-                #     result['incomplete'].append(1)
-                #     result['failed perturbation'].append(_failed_pert)
-                #     print('Yes, it is incompleteness!')
-                # else:
-                #     # print('No, not incompleteness!')
-                #     result['incomplete prediction'].append(-1)
-                #     result['incomplete'].append(0)
-                #     result['failed perturbation'].append([])
-                #     # result['single adv predictions'].append([])
-            # _df = pd.DataFrame(result)
-            # trial_df = _df[_df['trial'] == t]
-            # fpr = utils.calc_fpr(trial_df, len(trial_df))
-            # fnr = utils.calc_fnr(trial_df, len(trial_df))
-            # print(f' At trial {t}, the result of {method}', '-' * 80)
-            # print('  => FPR:', fpr)
-            # print('  => FNR:', fnr)
-            # print('=' * 100)
-            # _df.to_csv(os.path.join('result', f'baseline{t}_{ts}.csv'))
+            
             print(' Method:', method)
             print('m', m)
             print(' Trial', t, 'the number of completeness:', num_completeness)
@@ -1624,26 +980,6 @@ def verify_unlearning_baselines(args):
             result['q'].append(num_completeness / len(v_star))
             # result['q'].append(num_completeness / (len(v_star) * (2 ** args.num_perts - 2)))
 
-        # try:    
-        #     df = pd.DataFrame(result)
-        # except ValueError as err:
-        #     print('result', result)
-        #     raise err
-
-        # for t in range(args.num_trials):
-        #     _df = df[df['trial'] == t]
-        #     print(f'Trial {t}, the number of incompleteness:', _df['incomplete'].values.sum())
-        #     # print(f'Trial {t}, the number of fragile:', _df['fragileness'].values.sum())
-        # # incompleteness = df['incomplete'].values.sum()
-        # # print('  ==> The incompleteness:', incompleteness)
-
-        # result_filename = f'baseline_{ts}.csv'
-        # df.to_csv(os.path.join('result', result_filename))
-        # fpr = utils.calc_fpr(df, 100)
-        # fnr = utils.calc_fnr(df, 100)
-        # print('-' * 80)
-        # print('Verifing unlearning is done, the result file is saved to', result_filename)
-        # print('-' * 80)
     try:
         df = pd.DataFrame(result)
     except ValueError as err:
@@ -1761,192 +1097,6 @@ def find_1pf(args, target, surrogate, data, device, num_layer=2, verbose=False, 
     # print('-' * 60)
     return v_star, e_star, c_star
     
-def _verification_prob_guarantee(N, m, p):
-    return N * (1 - math.pow(1-p, 1/m))
-
-
-# def verify_mix_unlearning(args):
-#     device = utils.get_device(args)
-#     N = 100
-#     p = 0.95
-
-#     result = defaultdict(list)
-#     for t in range(args.num_trials):
-#         args.seed = random.randint(0, 1e+5)
-#         torch.manual_seed(args.seed)
-#         torch.cuda.manual_seed_all(args.seed)
-#         np.random.seed(args.seed)
-#         random.seed(args.seed)
-
-#         data = data_loader.load(args)
-
-#         target = _get_target_model(args, data, device)
-
-#         surroget = GNN(args, data.num_features, data.num_classes, surrogate=False, fix_weight=True)
-#         surroget.train(data, device)
-
-#         for m in range(10, 60, 10):
-#             k = math.ceil(_verification_prob_guarantee(N, m, p))
-#             tp = 0
-#             args.num_target_nodes = 1
-#             args.num_perts = k 
-#             num_challenges = []
-#             for _ in tqdm(range(500), desc=f'Verifying m={m}, k={k}'):
-#                 v_star, e_star, c_star = find_1pf(args, target, surroget, data, device)
-#                 v, e = v_star[0], e_star[0]
-#                 benign_edges = random.sample(data.edges.tolist(), N - k)
-#                 edges_to_remove = list(map(tuple, benign_edges)) + e
-
-#                 adv_data = copy.deepcopy(data)
-#                 adv_data.add_edges(to_undirected(torch.tensor(edges_to_remove).t()))
-#                 adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-#                 adv.train(adv_data, device)
-#                 adv_pred = adv.predict(adv_data, device, target_nodes=v_star)[0]
-
-#                 sub_perts = random.sample(edges_to_remove, N - m)
-
-#                 cheat_edges = set(edges_to_remove) - set(sub_perts)
-#                 count = 0
-#                 for _e in cheat_edges:
-#                     if _e in e:
-#                         count += 1
-#                 num_challenges.append(count)
-#                 pos_pred, verify_time2 = _unlearn_train_predict(args, adv_data, sub_perts, v_star, device)
-#                 if pos_pred[0] == adv_pred:
-#                     tp += 1
- 
-#             result['trial'].append(t)
-#             result['m'].append(m)
-#             result['k'].append(k)
-#             result['tpr'].append(tp / 100)
-#             result['num_challenges'].append(num_challenges)
-    
-#     df = pd.DataFrame(result)
-#     df.to_csv(os.path.join('result', f'mix_unlearning_{args.dataset}.csv'))
-#     _df = df[['m', 'k', 'tpr']]
-#     print('reuslt', _df.groupby(['m', 'k']).mean())
-
-
-def verify(args):
-    device = utils.get_device(args)
-    
-    ts = int(time.time())
-    result = defaultdict(list)
-    # for t in range(args.num_trials):
-    # t = args.trial
-    for t in range(args.num_trials):
-        # for method in ['ours']:
-        if os.path.exists(os.path.join('archive', str(t), args.dataset, f'seed_{args.method}.pkl')):
-            with open(os.path.join('archive', str(t), args.dataset, f'seed_{args.method}.pkl'), 'rb') as f:
-                args.seed = pickle.load(f)
-        else:
-            args.seed = random.randint(0, 1e+5)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-        np.random.seed(args.seed)
-        random.seed(args.seed)
-
-        data_file = os.path.join('archive', str(t), args.dataset, f'data_{args.method}.pkl')
-        print('data_file', data_file)
-        with open(data_file, 'rb') as f:
-            data = pickle.load(f)
-        target_model_file = os.path.join('archive', str(t), args.dataset, f'target_{args.method}.pt')
-        target_model = GNN(args, data.num_features, data.num_classes, surrogate=False, fix_weight=False)
-        target_model.load_model(target_model_file)
-
-        # surrogate_model_file = os.path.join('archive1', str(t), args.dataset, f'surrogate_{method}.pt')
-        # surrogate = GNN(args, data.num_features, data.num_classes, surrogate=method=='nettack', fix_weight=False)
-        # surrogate.load_model(surrogate_model_file)
-        v_star_file = os.path.join('archive', str(t), args.dataset, f'v_star_{args.method}.pkl')
-        with open(v_star_file, 'rb') as f:
-            v_star = pickle.load(f)
-        e_star_file = os.path.join('archive', str(t), args.dataset, f'e_star_{args.method}.pkl')
-        with open(e_star_file, 'rb') as f:
-            e_star = pickle.load(f)
-        p_star = target_model.predict(data, device, target_nodes=v_star)
-        v_star = v_star[:args.num_target_nodes]
-        e_star = e_star[:args.num_target_nodes]
-        p_star = p_star[:args.num_target_nodes]
-
-        target_res = target_model.evaluate(data, device)
-        tn, fp = 0, 0
-        tp, fn = defaultdict(int), defaultdict(int)
-        acc_losses = []
-        t0 = time.time()
-        for v, e, pred in tqdm(zip(v_star, e_star, p_star), total=len(v_star), desc=f'Trial {t}, method {args.method}, evaluating'):
-            if e is None or len(e) == 0:
-                continue
-            adv_data = copy.deepcopy(data)
-            adv_data.add_edges(to_undirected(torch.tensor(e).t()))
-            adv = GNN(args, adv_data.num_features, adv_data.num_classes, surrogate=False, fix_weight=True)
-            adv_filename = os.path.join('archive', str(t), args.dataset, f'adv_{args.method}_{v}.pt')
-            if os.path.exists(adv_filename):
-                adv.load_model(adv_filename)
-            else:
-                adv.train(adv_data, device)
-                adv.save_model(adv_filename)
-            adv_pred = adv.predict(adv_data, device, target_nodes=[v])
-
-            adv_res = adv.evaluate(adv_data, device) 
-            acc_loss = np.abs(target_res['accuracy'] - adv_res['accuracy']) / target_res['accuracy']
-            acc_losses.append(acc_loss)
-
-            neg_pred, verify_time1 = _unlearn_train_predict(args, adv_data, e, [v], device)
-            if neg_pred[0] != adv_pred:
-                tn += 1
-            else:
-                fp += 1
-
-            ''' Enumerate all the p percent of edges to verify'''
-            # false_neg = False
-            # for _edges in combinations(e, math.ceil(len(e) * p)):
-            #     print('  ==> verifying', _edges)
-            #     pos_pred, verify_time2 = _unlearn_train_predict(args, adv_data, _edges, [v], device)
-            #     if pos_pred[0] != adv_pred:
-            #         false_neg = True
-            #         print('label changed! when edge:', _edges)
-            #         break
-            # if false_neg:
-            #     fn += 1
-            # else:
-            #     tp += 1
-
-            ''' Randomly pick one p percent of edges to verify'''
-            for p in args.percentages:
-                sub_perts = random.sample(e, min(int(len(e) * (1 - p)), len(e) - 1))
-                pos_pred, verify_time2 = _unlearn_train_predict(args, adv_data, sub_perts, [v], device)
-                if pos_pred[0] == adv_pred:
-                    tp[p] += 1
-                else:
-                    fn[p] += 1                
-
-        for p in args.percentages:
-            result['trial'].append(t)
-            result['method'].append(args.method)
-            result['num node tokens'].append(args.num_target_nodes)
-            result['p'].append(p)
-            result['tp'].append(tp[p])
-            result['tn'].append(tn)
-            result['fp'].append(fp)
-            result['fn'].append(fn[p])
-            result['accuracy loss'].append(np.mean(acc_losses))
-            result['verify time'].append((verify_time1 + verify_time2) / 2)
-            result['total time'].append(time.time() - t0)
-
-        trial_df = pd.DataFrame(result)
-        trial_df = trial_df[trial_df['trial'] == t]
-        print('-' * 80)
-        print('Trial', t)
-        print(trial_df.groupby(['method', 'p']).mean()[['tp', 'tn', 'fp', 'fn', 'accuracy loss']])
-        print('-' * 80)
-        
-    df = pd.DataFrame(result)
-    print(df.groupby(['method', 'p']).mean()[['tp', 'tn', 'fp', 'fn', 'accuracy loss']])
-    result_filename = f'verify_{ts}_{args.dataset}.csv'
-    df.to_csv(os.path.join('result', result_filename)) 
-    print('Verifing is done, the result file is saved to', result_filename)
-
-
 def accuracy_loss(args):
     device = utils.get_device(args)
 
@@ -2099,91 +1249,6 @@ def check_1pf_success_rate(args):
             with open(c_star_filename, 'wb') as f:
                 pickle.dump(c_star, f)
 
-            # for v, e, pred, c in tqdm(zip(v_star, e_star, p_star, c_star), total=len(v_star), desc='checking 1PF'):
-            #     tn, fp, fn, tp = 0, 0, 0, 0
-            #     one_pf = False
-            #     one_p = 0
-            #     # one_pf_no_retrain = False
-            #     # one_p_no_retrain = 0
-            #     history, history2 = [], []
-            #     for one_pert in e:
-            #         adv_pred = _adv_train_predict(args, data, [one_pert], [v], device, type=args.gcn_type)[0]
-            #         # adv_pred_no_retrain = _adv_predict_without_retrain(args, target_model, data, [one_pert], [v], device)[0]
-            #         if adv_pred != pred:
-            #             one_pf = True
-            #             one_p += 1
-            #         history.append(adv_pred)
-            #         # history2.append(adv_pred_no_retrain)
-            #         # if adv_pred_no_retrain != pred:
-            #         #     one_pf_no_retrain = True
-            #         #     one_p_no_retrain += 1
-
-            #     result['trial'].append(t)
-            #     result['method'].append(method)
-            #     # result['target nodes'].append(v_star)
-            #     result['1pf'].append(one_pf)
-            #     result['1p'].append(one_p)
-            #     # result['1pf_no_retrain'].append(one_pf_no_retrain)
-            #     # result['1p_no_retrain'].append(one_p_no_retrain)
-
-            #     adv = GNN(args, data.num_features, data.num_classes, surrogate=False, fix_weight=True)
-            #     adv_data = copy.deepcopy(data)
-            #     adv_data.add_edges(to_undirected(torch.tensor(e).t()))
-            #     adv.train(adv_data, device)
-            #     adv_pred = adv.predict(adv_data, device, target_nodes=[v])[0]
-                
-            #     print('original prediction:', pred, ', attack label:', c)
-            #     print('history', history, ', + adv prediction:', adv_pred)
-            #     # print('history2', history2)
-
-            #     neg_pred, verify_time1 = _unlearn_train_predict(args, adv_data, e, [v], device)
-            #     if neg_pred[0] != adv_pred:
-            #         tn += 1
-            #     else:
-            #         fp += 1
-
-            #     ''' Enumerate all the p percent of edges to verify'''
-            #     # false_neg = False
-            #     # for _edges in combinations(e, math.ceil(len(e) * p)):
-            #     #     print('  ==> verifying', _edges)
-            #     #     pos_pred, verify_time2 = _unlearn_train_predict(args, adv_data, _edges, [v], device)
-            #     #     if pos_pred[0] != adv_pred:
-            #     #         false_neg = True
-            #     #         print('label changed! when edge:', _edges)
-            #     #         break
-            #     # if false_neg:
-            #     #     fn += 1
-            #     # else:
-            #     #     tp += 1
-
-            #     ''' Randomly pick one p percent of edges to verify'''
-            #     sub_perts = random.sample(e, min(int(len(e) * (1 - 0.1)), len(e) - 1))
-            #     pos_pred, verify_time2 = _unlearn_train_predict(args, adv_data, sub_perts, [v], device)
-            #     if pos_pred[0] == adv_pred:
-            #         tp += 1
-            #     else:
-            #         fn += 1
-                
-            #     result['p'].append(0.1)
-            #     result['clean prediction'].append(pred)
-            #     result['adv prediction'].append(adv_pred)
-            #     result['pos prediction'].append(pos_pred[0])
-            #     result['neg prediction'].append(neg_pred[0])
-            #     result['tp'].append(tp)
-            #     result['tn'].append(tn)
-            #     result['fp'].append(fp)
-            #     result['fn'].append(fn)
-            #     # result['verify time'].append((verify_time1 + verify_time2) / 2)
-
-            # _df = pd.DataFrame(result)
-            # _df = _df[(_df['trial'] == t) & (_df['method'] == method)]
-            # one_pf_success_rate = _df['1pf'].values.sum() / len(_df)
-            # one_p_success_rate = _df['1p'].values.sum() / (len(_df) * args.num_perts)
-            # print('At trial', t, ', Method:', method, '-' * 80)
-            # print('  ==> 1PF success rate:', one_pf_success_rate)
-            # print('  ==> 1P success rate:', one_p_success_rate)
-            # print('  ==> TPR', _df['tp'].values.sum() / (_df['tp'].values.sum() + _df['fn'].values.sum()))
-            # print('  ==> TNR', _df['tn'].values.sum() / (_df['tn'].values.sum() + _df['fp'].values.sum()))
     print('result', result)
     print('       ==> the data model is saved to ', data_filename)
     print('     ==> the target model is saved to ', target_filename)
@@ -2192,88 +1257,6 @@ def check_1pf_success_rate(args):
     print('           ==> the c_star is saved to ', c_star_filename)
     print('             ==> the seed is saved to ', seed_filename)
     
-
-
-def check_num_trials_and_success_rate(args):
-    device = utils.get_device(args)
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        random.seed(args.seed)
-        is_fixed_seed = True
-    else:
-        is_fixed_seed = False
-
-    result = defaultdict(list)
-    for t in range(args.num_trials):
-        if not is_fixed_seed:
-            args.seed = random.randint(0, 1e+5)
-            torch.manual_seed(args.seed)
-            torch.cuda.manual_seed_all(args.seed)
-            np.random.seed(args.seed)
-            random.seed(args.seed)
-
-        data = data_loader.load(args)
-
-        if args.gcn_type == '1-layer':
-            args.condidate_size = 1
-            args.candidate_hop = 1
-            target_model = GNN(args, data.num_features, data.num_classes, surrogate=False, fix_weight=True, layer1=True)
-        elif args.gcn_type == 'standard':
-            args.candidate_hop = 2
-            args.condidate_size = 1
-            target_model = GNN(args, data.num_features, data.num_classes, surrogate=False, fix_weight=True)
-        target_model.train(data, device)
-        # target_train_preds = target_model.predict(data, device, target_nodes=data.train_set.nodes.tolist())
-        # target_test_preds, target_test_posts = target_model.predict(data, device, target_nodes=data.test_set.nodes.tolist(), return_posterior=True)
-
-        weights = [p.detach().cpu().numpy() for p in target_model.model.parameters()]
-        verifier = CertifiedFragilenessLazy(args, weights, data, max_iter=50, num_layer=1 if args.gcn_type == '1-layer' else 2)
-
-        v_star, e_star, c_star = [], [], []
-        pbar = tqdm(total=args.num_target_nodes, desc='certifying')
-        num_iter = 0
-        while len(v_star) < args.num_target_nodes:
-            v = random.choice(data.test_set.nodes.tolist())
-            if v in v_star:
-                continue
-            pred, post= target_model.predict(data, device, target_nodes=[v], return_posterior=True)
-            c = _second_best_labels(post)[0]
-
-            v, p, c = certify_fragile_with_perturbations((v, pred[0], c), args, verifier, data)
-            if p is not None:
-                v_star.append(v)
-                e_star.append(p)
-                c_star.append(c)
-                pbar.update(1)
-            num_iter += 1
-            pbar.set_description(f'after certifying {num_iter} nodes')
-        pbar.close()
-        p_star = target_model.predict(data, device, target_nodes=v_star)
-
-        for v, e, p, c in tqdm(zip(v_star, e_star, p_star, c_star), total=len(v_star), desc='At {t}, evaluating'):
-            success_count = 0
-            for _e in e:
-                adv_pred = _adv_train_predict(args, data, [_e], [v], device, type=args.gcn_type)[0]
-                if adv_pred != p:
-                    success_count += 1
-                    break
-            
-        result['trial'].append(t)
-        result['target nodes'].append(v_star)
-        result['attack label'].append(c_star)
-        result['perturbations'].append(e_star)
-        result['target prediction'].append(p_star)
-        result['success count'].append(success_count)
-        result['num_iter'].append(num_iter)
-    
-    df = pd.DataFrame(result)
-    avg_iter_per_1pf = np.mean(df['num_iter'].values / args.num_target_nodes)
-    avg_success_rate = df['success count'].values.sum() / (args.num_perts * args.num_target_nodes)
-
-    print('avg_iter_per_1pf:', avg_iter_per_1pf)
-    print('avg_success_rate:', avg_success_rate)
-
 
 def new_verify_unlearning(args):
     # args.num_target_nodes = math.ceil(_calc_m(_alpha, _q[args.dataset]))
@@ -2459,19 +1442,6 @@ def performance_comparison(args):
 
                     if adv_pred != p:
                         _tn_count += 1
-
-                    # p = 0.2
-                    # sub_perts = random.sample(e, min(int(len(e) * (1 - 0.2)), len(e) - 1))
-                    # unlearn_data = copy.deepcopy(adv_data)
-                    # unlearn_data.remove_edges(sub_perts)
-                    # unlearn = GNN(args, unlearn_data.num_features, unlearn_data.num_classes, surrogate=False, fix_weight=True)
-                    # unlearn.train(unlearn_data, device)
-                    # unlearn_pred = unlearn.predict(unlearn_data, device, target_nodes=[v])
-                    # if unlearn_pred == adv_pred:
-                    #     _tp_count += 1
-                    
-                    # if _tp_count != 0 and _tn_count != 0:
-                    #     break
 
                 statistics['tp count'].append(_tp_count)
                 statistics['tn count'].append(_tn_count)
@@ -7621,8 +6591,7 @@ def empirical_vs_theoretical(args):
         surrogate = GNN(args, data.num_features, data.num_classes, surrogate=False, fix_weight=False)
         surrogate.train(surrogate_data, device)
 
-        # for p in [0.7, 0.75, 0.8, 0.85, 0.9, 0.95]:
-        for alpha in [0.99]:
+        for alpha in [0.7, 0.75, 0.8, 0.85, 0.9, 0.95]:
             m = _calc_m(alpha, _beta, _p[args.dataset]['ours'], _q[args.dataset]['ours'])
             print('Number of node tokens:', m, args.dataset)
             args.num_target_nodes = m
@@ -9237,50 +8206,11 @@ if __name__ == '__main__':
     elif args.task == 'baseline':
         verify_unlearning_baselines(args)
     elif args.task == 'verify':
-        verify(args)
-        # if args.baseline:
-        #     # for attack in ['pgd', 'ig', 'gf', 'minmax']:
-        #     for attack in ['nettack']:
-        #         args.edge_sampler = attack
-        #         print('-' * 80)
-        #         print('Attack:', attack)
-        #         print('-' * 80)
-        #         verify_unlearning_baselines(args)
-        # elif args.backdoor:
-        #     verify_unlearning_backdoor(args)
-        # else:
-        #     verify_unlearning(args)
-    elif args.task == 'verify-ours':
         new_verify_unlearning(args)
-    elif args.task == 'asr':
-        measure_asr(args)
-        # for attack in ['nettack', 'pgd', 'ig', 'gf', 'minmax']:
-        #     args.edge_sampler = attack
-        #     args.seed = None
-        #     measure_asr(args)
-
-    elif args.task == 'compare':
-        compare_node_samplers(args)
-    elif args.task == 'fragile':
-        verify_1perturbation_fragile_nodes(args)
-    elif args.task == 'fragile-pm':
-        estimate_pm_on_1pertubation_fragile_nodes(args)
-    elif args.task == 'global':
-        global_attack_for_1perturbation(args)
     elif args.task == 'efficiency':
         efficiency(args)
-
     elif args.task == 'surrogate_efficiency':
         efficiency_surrogate(args)
-
-    elif args.task == 'sen-b':
-        sensitivity_b(args)
-    elif args.task == 'sen-m':
-        sensitivity_m(args)
-    elif args.task == 'sen-t':
-        sensitivity_t(args)
-    elif args.task == 'sen-t-verify':
-        sensitivity_t_verify(args)
     elif args.task == 'composition':
         # for d in ['lastfm', 'cs']:
             # args.dataset = d
@@ -9299,13 +8229,6 @@ if __name__ == '__main__':
     # elif args.task == 'secret':
     #     secret_test(args)
     elif args.task == 'unlearn':
-        # for alpha1 in [0.12]:
-        #     for alpha2 in [0.24]:
-        #         for kappa in [0.01, 0.02, 0.03, 0.04, 0.05]:
-        #             args.alpha1 = alpha1
-        #             args.alpha2 = alpha2
-        #             args.kappa = kappa
-        #             vary_unlearning(args)
         args.alpha1 = 0.05
         args.alpha2 = 0.95
         args.kappa = 0.01
@@ -9315,100 +8238,26 @@ if __name__ == '__main__':
         args.alpha2 = 0.95
         args.kappa = 0.09
         vary_unlearning_batch(args)
-    elif args.task == 'unlearn-analysis':
-        args.alpha1 = 0.05
-        args.alpha2 = 0.95
-        args.kappa = 0.09
-        analysis_unlearning_methods(args)
-    elif args.task == 'nettack':
-        # test_nettack_edges(args)
-        # test_discrepancy(args)
-        test_nettack_on_lastfm(args)
-    elif args.task == 'rank':
-        test_rank(args)
-    elif args.task == 'dataset':
-        analyze_dataset(args)
     elif args.task == 'mix':
-        # verify_mix_unlearning(args)
-        # citeseer: mix_verify_unlearning_1723832725_citeseer.csv
-        for d in ['citeseer']:
-            args.dataset = d
-            if d == 'cs':
-                args.subgraph = 10000
-            verify_mix_unlearning(args)
-        # verify_mix_unlearning(args)
+        verify_mix_unlearning(args)
     elif args.task == 'estimate':
         estimate_p1_p2(args)
     elif args.task == 'estimate-baselines':
         estimate_p1_p2_baselines(args)
-    elif args.task == 'estimate-unlearn':
-        estimate_p_q_unlearn_methods(args)
-
     elif args.task == 'empirical':
-        for d in ['citeseer', 'lastfm', 'cs']:
-            args.dataset = d
-            if d == 'cs':
-                args.subgraph = 10000
-            else:
-                args.subgraph = None
-            empirical_vs_theoretical(args)
-    elif args.task == 'num-edges':
-        varying_num_edges(args)
+        empirical_vs_theoretical(args)
     elif args.task == 'incomplete-ratio':
         varying_incomplete_ratio(args)
-    elif args.task == 'num-edges-baselines':
-        varying_num_edges_baselines(args)
-    elif args.task == 'incomplete-ratio-baselines':
-        varying_incomplete_ratio_baselines(args)
-    elif args.task == 'estimate-lastfm':
-        estimate_lastfm(args)
     elif args.task == 'perform-comp':
-        # for d in ['citeseer', 'cs']:
-        #     args.dataset = d
-        # if args.dataset == 'cs':
-        #     args.subgraph = 10000
-        # else:
-        #     args.subgraph = None
         performance_comparison(args)
     elif args.task == 'detect':
-        for d in ['citeseer', 'lastfm', 'cs']:
-        # for d in ['lastfm', 'cs']:
-            args.dataset = d
-            if d == 'cs':
-                args.subgraph = 10000
-            else:
-                args.subgraph = None
-            detect_challenge_edges(args)
-
+        detect_challenge_edges(args)
     elif args.task == 'verify-detect':
-        # for d in ['cs']:
-        #     args.dataset = d
-        #     if d == 'cs':
-        #         args.subgraph = 10000
-        #     else:
-        #         args.subgraph = None
-        # for d in ['lastfm']:
-        #     args.dataset = d
-        if args.dataset == 'cs':
-            args.subgraph = 10000
         verification_with_detection(args)
-    elif args.task == 'detect':
-        if args.dataset == 'cs':
-            args.subgraph = 10000
-        batch_detection(args)
-
-    elif args.task == 'data':
-        analyze_dataset(args)
-
     elif args.task == 'batch':
         batch_verify(args)
-
     elif args.task == 'transfer':
         vary_target_model(args)
-    elif args.task == 'confidence':
-        confidence_target_model(args)
-    elif args.task == 'confidence-surrogate':
-        confidence_surrogate(args)
     elif args.task == 'num-nodes':
         varying_num_token_nodes(args)
     elif args.task == 'mix-guarantee':
@@ -9418,10 +8267,6 @@ if __name__ == '__main__':
         find_guaranteed_m()
     elif args.task == 'detection-analysis':
         detection_analysis(args)
-    # elif args.task == 'steallink':
-    #     steal_link(args)
-    elif args.task == 'rebuttal':
-        rebuttal(args)
     elif args.task == 'mia':
         verify_unlearning_mia(args)
     elif args.task == 'mia-random':

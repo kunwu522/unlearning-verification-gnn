@@ -101,11 +101,11 @@ def _get_cg_callback(v, **kwargs):
 class CEU(Unlearn):
 
     def __init__(self, seed, features, adj, labels, config, device, 
-                 model_type='gcn', epochs=1000, patience=10, damping=0.01,
+                 model_type='gcn', epochs=1000, patience=10, damping=0.001,
                  verbose=False) -> None:
         super().__init__(seed, features, adj, labels, config, device, model_type, epochs, verbose)
         self.patience = patience
-        self.damping = 0.01
+        self.damping = damping
 
         if self.model_type.lower() == "gat":
             self.model = GAT(nfeat=self.features.shape[1],
@@ -185,13 +185,16 @@ class CEU(Unlearn):
         # Evaluate the performance of the retraine model
         return self._evaluate(self.retrain_model, self.adj_prime_norm)
     
-    def predict(self, target_nodes, use_retrained=False, return_posterior=False):
+    def predict(self, target_nodes=None, use_retrained=False, return_posterior=False):
         model = self.retrain_model if use_retrained else self.model
         adj_norm = self.adj_prime_norm if use_retrained else self.adj_norm
 
         model.eval()
         with torch.no_grad():
-            outputs = model(self.features, adj_norm)[target_nodes]
+            if target_nodes is None:
+                outputs = model(self.features, adj_norm)
+            else:
+                outputs = model(self.features, adj_norm)[target_nodes]
         y_pred = torch.argmax(outputs, dim=1).cpu().numpy()
         if return_posterior:
             return y_pred, outputs.cpu().detach()

@@ -1531,7 +1531,8 @@ class GNNDelete(Unlearn):
                 deletion_mask[torch.nonzero(uv_idx).squeeze()] = True
                 deletion_mask[torch.nonzero(vu_idx).squeeze()] = True
             else:
-                raise ValueError(f'Invalid edge index, multiple e: ({u},{v}), {uv_idx.sum()}, {vu_idx.sum()}') 
+                continue
+                # raise ValueError(f'Invalid edge index, multiple e: ({u},{v}), {uv_idx.sum()}, {vu_idx.sum()}') 
         # print('edges 2:', _edge_index[:, deletion_mask])
         _, two_hop_edge, _, two_hop_mask = k_hop_subgraph(
             self.edge_index[:, deletion_mask].flatten().unique(),
